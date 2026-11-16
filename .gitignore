@@ -1,0 +1,22 @@
+# Android Build Intermediates
+.gradle/
+build/
+app/build/
+android-app/build/
+android-app/app/build/
+android-app/.gradle/
+android-app/app/.cxx/
+local.properties
+.idea/
+*.iml
+
+# PlatformIO Intermediates
+firmware/.pio/build/
+firmware/.pio/libdeps/
+firmware/.vscode/
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.bak

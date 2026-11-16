@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#000000"
+        android:pathData="M0,0h108v108h-108z"/>
+    <!-- Outer Hexagon -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3.5"
+        android:pathData="M54,14 L88,34 L88,74 L54,94 L20,74 L20,34 Z"/>
+    <!-- Inner Apex Triangle -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:pathData="M54,28 L78,70 L30,70 Z"/>
+    <!-- Center Dot / Ball Motif -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,46a5,5 0 1,0 0.001,0z"/>
+</vector>
