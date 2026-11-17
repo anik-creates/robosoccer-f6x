@@ -34,12 +34,16 @@ class F6xPreferencesRepository(private val context: Context) {
         val AUX_WIDGETS_JSON = stringPreferencesKey("aux_widgets_data")
 
         // Tank Drive Settings
+        val MAX_SPEED_PERCENT = intPreferencesKey("max_speed_percent")
+        val EXPO_PERCENT = intPreferencesKey("expo_percent")
+        val STEERING_SENSITIVITY = intPreferencesKey("steering_sensitivity")
         val SNAP_TO_AXES = booleanPreferencesKey("snap_to_axes")
         val SNAP_THRESHOLD = floatPreferencesKey("snap_threshold")
         val TANK_DEADZONE = floatPreferencesKey("tank_deadzone")
         val INVERT_STEERING = booleanPreferencesKey("invert_steering")
         val INVERT_THROTTLE = booleanPreferencesKey("invert_throttle")
         val LEFT_STICK_SNAP_CENTER = booleanPreferencesKey("left_stick_snap_center")
+        val GITHUB_REPO = stringPreferencesKey("github_repo")
     }
 
     // Default 10 Channels setup
@@ -233,23 +237,31 @@ class F6xPreferencesRepository(private val context: Context) {
         .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
         .map { prefs ->
             TankControlSettings(
+                maxSpeedPercent = prefs[Keys.MAX_SPEED_PERCENT] ?: 100,
+                expoPercent = prefs[Keys.EXPO_PERCENT] ?: 0,
+                deadzone = prefs[Keys.TANK_DEADZONE] ?: 0.15f,
                 snapToAxes = prefs[Keys.SNAP_TO_AXES] ?: true,
                 snapThreshold = prefs[Keys.SNAP_THRESHOLD] ?: 0.15f,
-                deadzone = prefs[Keys.TANK_DEADZONE] ?: 0.15f,
+                steeringSensitivity = prefs[Keys.STEERING_SENSITIVITY] ?: 100,
                 invertSteering = prefs[Keys.INVERT_STEERING] ?: false,
                 invertThrottle = prefs[Keys.INVERT_THROTTLE] ?: false,
-                leftStickSnapCenter = prefs[Keys.LEFT_STICK_SNAP_CENTER] ?: true
+                leftStickSnapCenter = prefs[Keys.LEFT_STICK_SNAP_CENTER] ?: true,
+                githubRepo = prefs[Keys.GITHUB_REPO] ?: "anik-creates/robosoccer-f6x"
             )
         }
 
     suspend fun saveTankSettings(settings: TankControlSettings) {
         context.dataStore.edit { prefs ->
+            prefs[Keys.MAX_SPEED_PERCENT] = settings.maxSpeedPercent
+            prefs[Keys.EXPO_PERCENT] = settings.expoPercent
+            prefs[Keys.TANK_DEADZONE] = settings.deadzone
             prefs[Keys.SNAP_TO_AXES] = settings.snapToAxes
             prefs[Keys.SNAP_THRESHOLD] = settings.snapThreshold
-            prefs[Keys.TANK_DEADZONE] = settings.deadzone
+            prefs[Keys.STEERING_SENSITIVITY] = settings.steeringSensitivity
             prefs[Keys.INVERT_STEERING] = settings.invertSteering
             prefs[Keys.INVERT_THROTTLE] = settings.invertThrottle
             prefs[Keys.LEFT_STICK_SNAP_CENTER] = settings.leftStickSnapCenter
+            prefs[Keys.GITHUB_REPO] = settings.githubRepo
         }
     }
 }

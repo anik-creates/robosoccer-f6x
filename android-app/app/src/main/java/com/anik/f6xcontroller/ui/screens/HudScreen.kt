@@ -5,7 +5,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -61,9 +63,13 @@ fun HudScreen(
     val isAddChannelOpen by viewModel.isAddChannelOpen.collectAsState()
     val isChannelMonitorOpen by viewModel.isChannelMonitorOpen.collectAsState()
     val isQuickSetupOpen by viewModel.isQuickSetupOpen.collectAsState()
+    val isTuningOpen by viewModel.isTuningOpen.collectAsState()
+    val isUpdateDialogOpen by viewModel.isUpdateDialogOpen.collectAsState()
 
     val updateInfo by viewModel.updateInfo.collectAsState()
     val isCheckingUpdate by viewModel.isCheckingUpdate.collectAsState()
+    val updateStatusText by viewModel.updateStatusText.collectAsState()
+    val updateProgress by viewModel.updateProgress.collectAsState()
 
     Box(
         modifier = Modifier
@@ -72,25 +78,22 @@ fun HudScreen(
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             // -------------------------------------------------------------------------
-            // Top Modern Designer Navbar with Live Motor Graph (TX Count OFF)
+            // Locked-Height Top Navbar (Strictly Fixed 48.dp, Never Squeezes Vertically)
             // -------------------------------------------------------------------------
             ApexTopNavbar(
                 isWifiConnected = isWifiLocked,
                 telemetry = telemetry,
-                isEditMode = isEditMode,
                 hasUpdate = updateInfo != null,
+                onOpenTuning = { viewModel.isTuningOpen.value = true },
                 onToggleChannelMonitor = { viewModel.isChannelMonitorOpen.value = !isChannelMonitorOpen },
                 onToggleQuickSetup = { viewModel.isQuickSetupOpen.value = !isQuickSetupOpen },
                 onToggleEditMode = { viewModel.toggleEditMode() },
                 onOpenAddChannel = { viewModel.isAddChannelOpen.value = true },
-                onOpenMenu = { viewModel.isMenuOpen.value = true },
-                onUpdateClick = {
-                    if (updateInfo != null) {
-                        viewModel.downloadAndInstallUpdate(context)
-                    } else {
-                        viewModel.checkForUpdates()
-                    }
+                onOpenUpdate = {
+                    viewModel.isUpdateDialogOpen.value = true
+                    viewModel.checkForUpdates()
                 },
+                onOpenMenu = { viewModel.isMenuOpen.value = true },
                 onEmergencyBrake = { viewModel.emergencyStop() }
             )
 
@@ -103,7 +106,7 @@ fun HudScreen(
                     .weight(1f)
                     .background(PureBlack)
             ) {
-                // 1. Left Virtual Joystick (Snap to Center Trim Stick)
+                // 1. Left Virtual Joystick (Snap-to-Center Trim Stick)
                 // Anchored firmly at Bottom-Start with fixed margin (zero drifting)
                 Box(
                     modifier = Modifier
@@ -118,6 +121,7 @@ fun HudScreen(
                         yValue = rawSticks.leftY,
                         autoCenterX = true,
                         autoCenterY = tankSettings.leftStickSnapCenter,
+                        deadzone = tankSettings.deadzone,
                         scale = joystickPositions.leftScale,
                         isEditMode = isEditMode,
                         isSelected = selectedWidgetId == "STICK_LEFT",
@@ -131,7 +135,7 @@ fun HudScreen(
                     )
                 }
 
-                // 2. Right Virtual Joystick (CH1 STEERING + CH2 THROTTLE DRIVE)
+                // 2. Right Virtual Joystick (CH1 STEERING + CH2 THROTTLE DRIVE with 15% Axis Snapping)
                 // Anchored firmly at Bottom-End with fixed margin (zero drifting)
                 Box(
                     modifier = Modifier
@@ -146,6 +150,9 @@ fun HudScreen(
                         yValue = rawSticks.rightY,
                         autoCenterX = true,
                         autoCenterY = true,
+                        snapToAxes = tankSettings.snapToAxes,
+                        snapThreshold = tankSettings.snapThreshold,
+                        deadzone = tankSettings.deadzone,
                         scale = joystickPositions.rightScale,
                         isEditMode = isEditMode,
                         isSelected = selectedWidgetId == "STICK_RIGHT",
@@ -274,6 +281,38 @@ fun HudScreen(
         }
 
         // -----------------------------------------------------------------------------
+        // Dedicated Tank Bot Tuning & Dynamics Dialog (Expo, Speed Limiter, Deadzone, Snap)
+        // -----------------------------------------------------------------------------
+        if (isTuningOpen) {
+            TankTuningDialog(
+                tankSettings = tankSettings,
+                mixingMode = mixingMode,
+                onUpdateTankSettings = { viewModel.updateTankSettings(it) },
+                onSelectMixingMode = { viewModel.setMixingMode(it) },
+                onDismiss = { viewModel.isTuningOpen.value = false }
+            )
+        }
+
+        // -----------------------------------------------------------------------------
+        // Dedicated GitHub App Update Dialog
+        // -----------------------------------------------------------------------------
+        if (isUpdateDialogOpen) {
+            AppUpdateDialog(
+                currentRepo = tankSettings.githubRepo,
+                updateInfo = updateInfo,
+                isChecking = isCheckingUpdate,
+                statusText = updateStatusText,
+                downloadProgress = updateProgress,
+                onCheckUpdate = { repo ->
+                    viewModel.updateTankSettings(tankSettings.copy(githubRepo = repo))
+                    viewModel.checkForUpdates(repo)
+                },
+                onDownloadUpdate = { ctx -> viewModel.downloadAndInstallUpdate(ctx) },
+                onDismiss = { viewModel.isUpdateDialogOpen.value = false }
+            )
+        }
+
+        // -----------------------------------------------------------------------------
         // Live Channel Output Monitor Overlay
         // -----------------------------------------------------------------------------
         if (isChannelMonitorOpen) {
@@ -353,32 +392,35 @@ fun HudScreen(
 private fun ApexTopNavbar(
     isWifiConnected: Boolean,
     telemetry: com.anik.f6xcontroller.data.TelemetryStats,
-    isEditMode: Boolean,
     hasUpdate: Boolean,
+    onOpenTuning: () -> Unit,
     onToggleChannelMonitor: () -> Unit,
     onToggleQuickSetup: () -> Unit,
     onToggleEditMode: () -> Unit,
     onOpenAddChannel: () -> Unit,
+    onOpenUpdate: () -> Unit,
     onOpenMenu: () -> Unit,
-    onUpdateClick: () -> Unit,
     onEmergencyBrake: () -> Unit
 ) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            .height(48.dp)
             .background(PureBlack)
             .border(width = 1.dp, color = PillBorderMuted)
-            .padding(horizontal = 14.dp, vertical = 6.dp)
+            .padding(horizontal = 10.dp),
+        contentAlignment = Alignment.CenterStart
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // Left: Unique Brand Logo + Name + Live Bot Connection Pill
+            // Left: Unique Brand Logo + Name + Live Bot Connection Pill (Locked 32.dp height)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.height(32.dp)
             ) {
                 // Sleek Geometric Vector Logo (Hexagon Soccer Motive)
                 Canvas(modifier = Modifier.size(24.dp)) {
@@ -412,22 +454,26 @@ private fun ApexTopNavbar(
                     text = "APEX-F6X",
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    letterSpacing = 1.5.sp,
-                    color = PureWhite
+                    fontSize = 12.sp,
+                    letterSpacing = 1.sp,
+                    color = PureWhite,
+                    maxLines = 1,
+                    softWrap = false
                 )
 
                 // Bot Connection Status Pill
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
+                        .height(26.dp)
+                        .clip(RoundedCornerShape(13.dp))
                         .background(if (isWifiConnected) PureWhite else PillSurface)
                         .border(
                             width = 1.dp,
                             color = if (isWifiConnected) PureWhite else PillBorderMuted,
-                            shape = RoundedCornerShape(20.dp)
+                            shape = RoundedCornerShape(13.dp)
                         )
-                        .padding(horizontal = 9.dp, vertical = 3.dp)
+                        .padding(horizontal = 8.dp),
+                    contentAlignment = Alignment.Center
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
@@ -442,75 +488,79 @@ private fun ApexTopNavbar(
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
                             fontSize = 9.sp,
-                            letterSpacing = 0.5.sp,
-                            color = if (isWifiConnected) PureBlack else TextSecondary
+                            color = if (isWifiConnected) PureBlack else TextSecondary,
+                            maxLines = 1,
+                            softWrap = false
                         )
                     }
                 }
             }
 
-            // Center: Live Left & Right Motor Speed Graph (Forward & Reverse) - TX Count OFF!
+            // Center: Live Left & Right Motor Speed Graph (Forward & Reverse) - Locked 32.dp height
             TankMotorSpeedGraph(
                 leftPwm = telemetry.leftPwm.toInt(),
                 rightPwm = telemetry.rightPwm.toInt(),
-                lastRttMs = telemetry.lastRttMs,
-                ackCount = telemetry.ackCount
+                lastRttMs = telemetry.lastRttMs
             )
 
-            // Right: Modern Designer Navigation Action Pills
+            // Right: Responsive Action Pills (Locked 32.dp height, Never wraps vertically)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier
+                    .height(32.dp)
+                    .horizontalScroll(rememberScrollState())
             ) {
+                // TUNING Pill Button (Direct Access to Speed Limiter, Expo, Deadzone, Snap)
+                NavPillButton(label = "TUNING", onClick = onOpenTuning)
+
                 // CHANNELS Pill Button (Live Channel Monitor)
                 NavPillButton(label = "CHANNELS", onClick = onToggleChannelMonitor)
 
                 // + ADD CH Pill Button
                 NavPillButton(label = "+ ADD CH", onClick = onOpenAddChannel)
 
-                // EDIT HUD Pill Button
-                NavPillButton(
-                    label = if (isEditMode) "[EDITING]" else "EDIT HUD",
-                    isSelected = isEditMode,
-                    onClick = onToggleEditMode
-                )
-
                 // SETUP Pill Button (Beginner Guide)
                 NavPillButton(label = "SETUP", onClick = onToggleQuickSetup)
 
-                // UPDATE Pill Button (with badge if update found)
+                // UPDATE Pill Button (Opens GitHub Update Dialog)
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
+                        .height(30.dp)
+                        .clip(RoundedCornerShape(15.dp))
                         .background(if (hasUpdate) PureWhite else PillSurface)
                         .border(
                             width = 1.dp,
                             color = if (hasUpdate) PureWhite else PillBorderMuted,
-                            shape = RoundedCornerShape(20.dp)
+                            shape = RoundedCornerShape(15.dp)
                         )
-                        .clickable(onClick = onUpdateClick)
-                        .padding(horizontal = 9.dp, vertical = 4.dp)
+                        .clickable(onClick = onOpenUpdate)
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = if (hasUpdate) "★ UPDATE" else "UPDATE",
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
                         fontSize = 10.sp,
-                        letterSpacing = 0.5.sp,
-                        color = if (hasUpdate) PureBlack else TextSecondary
+                        color = if (hasUpdate) PureBlack else TextSecondary,
+                        maxLines = 1,
+                        softWrap = false
                     )
                 }
 
-                // MENU Pill Button
+                // MENU Pill Button (FlySky Advanced Settings)
                 NavPillButton(label = "MENU", onClick = onOpenMenu)
 
                 // BRAKE / STOP Pill Button
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(20.dp))
+                        .height(30.dp)
+                        .clip(RoundedCornerShape(15.dp))
                         .background(PureWhite)
                         .clickable(onClick = onEmergencyBrake)
-                        .padding(horizontal = 11.dp, vertical = 4.dp)
+                        .padding(horizontal = 12.dp),
+                    contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = "BRAKE",
@@ -518,7 +568,9 @@ private fun ApexTopNavbar(
                         fontWeight = FontWeight.Bold,
                         fontSize = 10.sp,
                         letterSpacing = 0.5.sp,
-                        color = PureBlack
+                        color = PureBlack,
+                        maxLines = 1,
+                        softWrap = false
                     )
                 }
             }
@@ -528,24 +580,23 @@ private fun ApexTopNavbar(
 
 /**
  * Live Bipolar Motor Speed Graph for 4WD Tank Drive (Forward & Reverse)
- * Completely eliminates TX count clutter, replacing it with an intuitive visual speed graph.
  */
 @Composable
 private fun TankMotorSpeedGraph(
     leftPwm: Int,
     rightPwm: Int,
-    lastRttMs: Float,
-    ackCount: Long
+    lastRttMs: Float
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.height(32.dp)
     ) {
         // Left Track Dynamic Meter
-        SingleTrackSpeedMeter(label = "L TRACK", pwm = leftPwm)
+        SingleTrackSpeedMeter(label = "L", pwm = leftPwm)
 
         // Right Track Dynamic Meter
-        SingleTrackSpeedMeter(label = "R TRACK", pwm = rightPwm)
+        SingleTrackSpeedMeter(label = "R", pwm = rightPwm)
 
         // RTT Latency
         Text(
@@ -553,7 +604,9 @@ private fun TankMotorSpeedGraph(
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
             fontSize = 10.sp,
-            color = PureWhite
+            color = PureWhite,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -564,28 +617,30 @@ private fun SingleTrackSpeedMeter(
     pwm: Int
 ) {
     val norm = (pwm / 255.0f).coerceIn(-1.0f, 1.0f)
-    val isFwd = pwm >= 0
     val pct = (abs(norm) * 100).roundToInt()
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
         modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
+            .height(26.dp)
+            .clip(RoundedCornerShape(6.dp))
             .background(PillSurface)
-            .border(1.dp, PillBorderMuted, RoundedCornerShape(8.dp))
-            .padding(horizontal = 6.dp, vertical = 3.dp)
+            .border(1.dp, PillBorderMuted, RoundedCornerShape(6.dp))
+            .padding(horizontal = 5.dp)
     ) {
         Text(
             text = label,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
             fontSize = 9.sp,
-            color = TextSecondary
+            color = TextSecondary,
+            maxLines = 1,
+            softWrap = false
         )
 
         // Bipolar Bar Graphic (Center 0, Left = REV, Right = FWD)
-        Canvas(modifier = Modifier.size(width = 60.dp, height = 12.dp)) {
+        Canvas(modifier = Modifier.size(width = 46.dp, height = 10.dp)) {
             val w = size.width
             val h = size.height
             val midX = w / 2f
@@ -612,8 +667,8 @@ private fun SingleTrackSpeedMeter(
                 val barW = (midX * norm)
                 drawRoundRect(
                     color = PureWhite,
-                    topLeft = Offset(midX, 2f),
-                    size = Size(barW, h - 4f),
+                    topLeft = Offset(midX, 1.5f),
+                    size = Size(barW, h - 3f),
                     cornerRadius = CornerRadius(1.dp.toPx())
                 )
             } else if (norm < 0) {
@@ -621,21 +676,23 @@ private fun SingleTrackSpeedMeter(
                 val barW = (midX * abs(norm))
                 drawRoundRect(
                     color = Color(0xFFAAAAAA),
-                    topLeft = Offset(midX - barW, 2f),
-                    size = Size(barW, h - 4f),
+                    topLeft = Offset(midX - barW, 1.5f),
+                    size = Size(barW, h - 3f),
                     cornerRadius = CornerRadius(1.dp.toPx())
                 )
             }
         }
 
         // Percentage & Direction
-        val dir = if (pwm > 0) "FWD" else if (pwm < 0) "REV" else "STOP"
+        val dir = if (pwm > 0) "F" else if (pwm < 0) "R" else "0"
         Text(
-            text = "$dir $pct%",
+            text = "$dir$pct%",
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
-            fontSize = 9.sp,
-            color = PureWhite
+            fontSize = 8.sp,
+            color = PureWhite,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }
@@ -648,23 +705,26 @@ private fun NavPillButton(
 ) {
     Box(
         modifier = Modifier
-            .clip(RoundedCornerShape(20.dp))
+            .height(30.dp)
+            .clip(RoundedCornerShape(15.dp))
             .background(if (isSelected) PureWhite else PillSurface)
             .border(
                 width = 1.dp,
                 color = if (isSelected) PureWhite else PillBorderMuted,
-                shape = RoundedCornerShape(20.dp)
+                shape = RoundedCornerShape(15.dp)
             )
             .clickable(onClick = onClick)
-            .padding(horizontal = 9.dp, vertical = 4.dp)
+            .padding(horizontal = 9.dp),
+        contentAlignment = Alignment.Center
     ) {
         Text(
             text = label,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
             fontSize = 10.sp,
-            letterSpacing = 0.5.sp,
-            color = if (isSelected) PureBlack else PureWhite
+            color = if (isSelected) PureBlack else PureWhite,
+            maxLines = 1,
+            softWrap = false
         )
     }
 }

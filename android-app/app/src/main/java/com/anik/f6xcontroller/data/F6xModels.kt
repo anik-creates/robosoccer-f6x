@@ -20,15 +20,19 @@ enum class MixingMode(val label: String) {
 }
 
 /**
- * Tank Drive Control & Snapping Settings.
+ * Tank Drive Control, Snapping, Expo & Speed Limiter Settings.
  */
 data class TankControlSettings(
+    val maxSpeedPercent: Int = 100,          // 20% to 100% (Speed Limiter / Governor)
+    val expoPercent: Int = 0,                // -100% to +100% Exponential response curve
+    val deadzone: Float = 0.15f,             // 0% to 30% center deadband
     val snapToAxes: Boolean = true,          // Snap X or Y to axis when close to center line
-    val snapThreshold: Float = 0.15f,        // 15% threshold for axis snapping
-    val deadzone: Float = 0.15f,             // 15% center deadband
+    val snapThreshold: Float = 0.15f,        // 5% to 35% threshold for axis snapping
+    val steeringSensitivity: Int = 100,      // 20% to 100% Steering Sensitivity (Dual Rate)
     val invertSteering: Boolean = false,     // Invert Left/Right steering
     val invertThrottle: Boolean = false,     // Invert Forward/Reverse throttle
-    val leftStickSnapCenter: Boolean = true  // Snap left stick to center (0,0) when released
+    val leftStickSnapCenter: Boolean = true, // Snap left stick to center (0,0) when released
+    val githubRepo: String = "anik-creates/robosoccer-f6x" // Target GitHub repo for updates
 )
 
 /**

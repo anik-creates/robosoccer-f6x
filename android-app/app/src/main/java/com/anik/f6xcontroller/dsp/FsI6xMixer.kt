@@ -153,8 +153,18 @@ object FsI6xMixer {
         rightStickY: Float,
         tankSettings: TankControlSettings = TankControlSettings()
     ): Pair<Short, Short> {
-        val effThrottle = if (tankSettings.invertThrottle) -throttle else throttle
-        val effSteering = if (tankSettings.invertSteering) -steering else steering
+        val speedLimit = (tankSettings.maxSpeedPercent / 100.0f).coerceIn(0.1f, 1.0f)
+        val steerSens = (tankSettings.steeringSensitivity / 100.0f).coerceIn(0.2f, 1.0f)
+
+        var effThrottle = if (tankSettings.invertThrottle) -throttle else throttle
+        var effSteering = (if (tankSettings.invertSteering) -steering else steering) * steerSens
+
+        // Apply Tank Global Exponential Curve if configured
+        if (tankSettings.expoPercent != 0) {
+            val expo = (tankSettings.expoPercent / 100.0f).coerceIn(-1.0f, 1.0f)
+            effThrottle = ((1.0f - expo) * effThrottle + expo * (effThrottle * effThrottle * effThrottle)).coerceIn(-1.0f, 1.0f)
+            effSteering = ((1.0f - expo) * effSteering + expo * (effSteering * effSteering * effSteering)).coerceIn(-1.0f, 1.0f)
+        }
 
         return when (mixingMode) {
             MixingMode.ARCADE -> {
@@ -166,8 +176,8 @@ object FsI6xMixer {
 
                 // Smooth magnitude normalization so blended turns don't clip
                 val maxMag = maxOf(abs(rawLeft), abs(rawRight), 1.0f)
-                val left = rawLeft / maxMag
-                val right = rawRight / maxMag
+                val left = (rawLeft / maxMag) * speedLimit
+                val right = (rawRight / maxMag) * speedLimit
 
                 val leftPwm = (left * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
                 val rightPwm = (right * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
@@ -178,8 +188,8 @@ object FsI6xMixer {
                 val leftInput = if (tankSettings.invertThrottle) -leftStickY else leftStickY
                 val rightInput = if (tankSettings.invertThrottle) -rightStickY else rightStickY
 
-                val leftPwm = (leftInput * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
-                val rightPwm = (rightInput * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
+                val leftPwm = (leftInput * speedLimit * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
+                val rightPwm = (rightInput * speedLimit * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
                 Pair(leftPwm, rightPwm)
             }
         }

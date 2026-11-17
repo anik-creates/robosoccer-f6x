@@ -62,12 +62,15 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     val isAddChannelOpen = MutableStateFlow(false)
     val isChannelMonitorOpen = MutableStateFlow(false)
     val isQuickSetupOpen = MutableStateFlow(false)
+    val isTuningOpen = MutableStateFlow(false)
+    val isUpdateDialogOpen = MutableStateFlow(false)
 
     // GitHub In-App Auto-Update States
     val isCheckingUpdate = MutableStateFlow(false)
     val updateInfo = MutableStateFlow<UpdateInfo?>(null)
     val updateProgress = MutableStateFlow<Float?>(null)
     val updateError = MutableStateFlow<String?>(null)
+    val updateStatusText = MutableStateFlow<String?>("Tap Check to query latest GitHub release")
 
     // Telemetry from C++ Engine
     private val _telemetry = MutableStateFlow(TelemetryStats())
@@ -152,15 +155,31 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun checkForUpdates() {
+    fun checkForUpdates(customRepo: String? = null) {
+        val repo = customRepo ?: tankSettings.value.githubRepo
         viewModelScope.launch {
             isCheckingUpdate.value = true
+            updateStatusText.value = "Connecting to GitHub ($repo)..."
             updateError.value = null
             try {
-                val info = AppUpdateManager.checkLatestRelease()
-                updateInfo.value = info
+                when (val result = AppUpdateManager.checkLatestRelease(repo)) {
+                    is com.anik.f6xcontroller.network.CheckUpdateResult.UpdateAvailable -> {
+                        updateInfo.value = result.info
+                        updateStatusText.value = "New release available: ${result.info.tagName}!"
+                    }
+                    is com.anik.f6xcontroller.network.CheckUpdateResult.UpToDate -> {
+                        updateInfo.value = null
+                        updateStatusText.value = "App is already up-to-date (v${result.currentVersion})."
+                    }
+                    is com.anik.f6xcontroller.network.CheckUpdateResult.Error -> {
+                        updateInfo.value = null
+                        updateStatusText.value = result.message
+                        updateError.value = result.message
+                    }
+                }
             } catch (e: Exception) {
                 updateError.value = e.message
+                updateStatusText.value = "Error: ${e.message}"
             } finally {
                 isCheckingUpdate.value = false
             }

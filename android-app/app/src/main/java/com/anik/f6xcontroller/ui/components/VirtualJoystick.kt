@@ -22,8 +22,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.anik.f6xcontroller.ui.theme.*
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -37,6 +39,9 @@ fun VirtualJoystick(
     yValue: Float, // -1.0f to +1.0f
     autoCenterX: Boolean = true,
     autoCenterY: Boolean = true,
+    snapToAxes: Boolean = false,
+    snapThreshold: Float = 0.15f,
+    deadzone: Float = 0.15f,
     onValueChange: (x: Float, y: Float) -> Unit,
     onToggleAutoCenter: (() -> Unit)? = null,
     baseSizeDp: Int = 180,
@@ -68,11 +73,38 @@ fun VirtualJoystick(
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(autoCenterX, autoCenterY, scale, isEditMode) {
+                .pointerInput(autoCenterX, autoCenterY, scale, isEditMode, snapToAxes, snapThreshold, deadzone) {
                     if (isEditMode) return@pointerInput
 
                     val radius = size.width / 2.0f
                     val maxTravel = radius * 0.75f
+
+                    fun calculateSnapped(dx: Float, dy: Float): Pair<Float, Float> {
+                        val rawX = (dx / maxTravel).coerceIn(-1f, 1f)
+                        val rawY = (-dy / maxTravel).coerceIn(-1f, 1f)
+
+                        var normX = rawX
+                        var normY = rawY
+
+                        // 1. Center deadzone
+                        if (hypot(rawX, rawY) < deadzone) {
+                            return Pair(0f, 0f)
+                        }
+
+                        // 2. Axis snapping
+                        if (snapToAxes) {
+                            // Snap to vertical axis (straight forward/reverse)
+                            if (abs(rawX) < snapThreshold && abs(rawY) >= deadzone) {
+                                normX = 0f
+                            }
+                            // Snap to horizontal axis (spot turn / spin)
+                            if (abs(rawY) < snapThreshold && abs(rawX) >= deadzone) {
+                                normY = 0f
+                            }
+                        }
+
+                        return Pair(normX, normY)
+                    }
 
                     detectDragGestures(
                         onDragStart = { offset ->
@@ -84,10 +116,9 @@ fun VirtualJoystick(
 
                             val tx = clampedDist * cos(angle)
                             val ty = clampedDist * sin(angle)
-                            thumbOffset = Offset(tx, ty)
 
-                            val normX = (tx / maxTravel).coerceIn(-1f, 1f)
-                            val normY = (-ty / maxTravel).coerceIn(-1f, 1f)
+                            val (normX, normY) = calculateSnapped(tx, ty)
+                            thumbOffset = Offset(normX * maxTravel, -normY * maxTravel)
                             onValueChange(normX, normY)
                         },
                         onDrag = { change, dragAmount ->
@@ -99,10 +130,9 @@ fun VirtualJoystick(
 
                             val tx = clampedDist * cos(angle)
                             val ty = clampedDist * sin(angle)
-                            thumbOffset = Offset(tx, ty)
 
-                            val normX = (tx / maxTravel).coerceIn(-1f, 1f)
-                            val normY = (-ty / maxTravel).coerceIn(-1f, 1f)
+                            val (normX, normY) = calculateSnapped(tx, ty)
+                            thumbOffset = Offset(normX * maxTravel, -normY * maxTravel)
                             onValueChange(normX, normY)
                         },
                         onDragEnd = {
