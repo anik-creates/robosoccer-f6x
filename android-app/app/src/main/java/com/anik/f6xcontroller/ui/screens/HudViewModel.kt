@@ -103,6 +103,8 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     private var javaAckCount: Long = 0L
     private var lastRttMs: Float = 0f
     private val txTimestamps = java.util.concurrent.ConcurrentHashMap<Short, Long>()
+    private var cachedTargetIp: String = ""
+    private var cachedTargetAddr: InetAddress? = null
 
     private fun getSubnetDatagramSocket(): DatagramSocket? {
         try {
@@ -144,11 +146,15 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             Log.e("HudViewModel", "Failed to create fallback socket: ${e.message}")
         }
 
-        // Continuous Wi-Fi watchdog: runs every 200 ms to auto-lock process to robot Wi-Fi as soon as connected
+        // Intelligent Wi-Fi watchdog: checks every 500 ms while disconnected, backs off to 3000 ms once locked
         viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
-                wifiLockManager.checkExistingWifiConnection()
-                delay(200)
+                if (!wifiLockManager.isConnected.value) {
+                    wifiLockManager.checkExistingWifiConnection()
+                    delay(500)
+                } else {
+                    delay(3000)
+                }
             }
         }
 
@@ -302,7 +308,11 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             buf.putShort(crc.toShort())
 
             val targetIp = if (ip.isBlank()) "192.168.4.1" else ip
-            val targetAddr = InetAddress.getByName(targetIp)
+            if (cachedTargetAddr == null || cachedTargetIp != targetIp) {
+                cachedTargetIp = targetIp
+                cachedTargetAddr = InetAddress.getByName(targetIp)
+            }
+            val targetAddr = cachedTargetAddr ?: InetAddress.getByName("192.168.4.1")
             val packet = DatagramPacket(bytes, 12, targetAddr, port)
 
             // Select single best socket to prevent duplicate packet flooding and WiFi contention:
@@ -317,12 +327,9 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
                     s.send(packet)
                     javaTxCount++
                     txTimestamps[javaTxSeq] = System.currentTimeMillis()
-
-                    // Broadcast only once every 128 packets (~1.28s) for background discovery
-                    if ((javaTxSeq.toInt() and 0x7F) == 0) {
-                        val bcastAddr = InetAddress.getByName("192.168.4.255")
-                        val bcastPacket = DatagramPacket(bytes, 12, bcastAddr, port)
-                        s.send(bcastPacket)
+                    // Keep txTimestamps bounded to eliminate GC memory churn
+                    if (txTimestamps.size > 64) {
+                        txTimestamps.clear()
                     }
                 } catch (e: Exception) {
                     Log.w("HudViewModel", "Socket send error: ${e.message}")

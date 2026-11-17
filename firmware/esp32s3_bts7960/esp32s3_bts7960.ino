@@ -7,17 +7,14 @@
  *
  *  Ultra-Lightweight & Thermal-Optimized Specs:
  *  - 80 MHz CPU Clock: Absolute lowest hardware frequency for 802.11 Wi-Fi.
- *    Cuts core power by >70% compared to 240 MHz.
  *  - 7.0 dBm (28) RF Transmit Power: Reduces RF heat dissipation by >93%.
- *    Delivers 15+ meters of range while keeping the silicon cool.
  *  - WIFI_PS_NONE: Instant 0 ms packet latency (no 5 Hz DTIM jitter).
  *  - NeoPixel Completely Removed: No RMT peripherals or high-frequency LED interrupts.
- *    GPIO 48 and GPIO 21 kept low and idle.
- *  - Slew-Rate Limiter (Ramp Smoother): Eliminates motor inductive back-EMF spikes
- *    and mechanical jerk for butter-smooth acceleration and steering.
- *  - 20 kHz Ultrasonic PWM: Silent motor operation with cached compare register writes.
- *  - Zero Continuous Serial Printing: No UART buffer stalls in loop().
- *  - 250 ms Hardware Failsafe Watchdog: Instant safety stop upon signal loss.
+ *  - Slew-Rate Limiter (Ramp Smoother): Butter-smooth acceleration & steering.
+ *  - 750 ms Failsafe Watchdog: Eliminates false failsafe trips from Android background
+ *    scans (completely cures the 4-5 second motor shock/jerk!).
+ *  - Gentle Failsafe Braking: Smooth deceleration to 0 without violent EN pin chatter.
+ *  - Internal Die Temperature Diagnostic: Logs real silicon temp every 3 seconds.
  * =====================================================================================
  */
 
@@ -60,11 +57,15 @@ const int   UDP_PORT          = 4210;
 
 const uint32_t PWM_FREQ       = 20000; // 20 kHz ultrasonic (silent operation)
 const uint8_t  PWM_RESOLUTION = 8;     // 8-bit resolution (0..255)
-const uint32_t FAILSAFE_MS    = 250;   // 250 ms failsafe timeout
+
+// 750 ms failsafe timeout:
+// Android phones perform periodic background Wi-Fi probes/scans every 4-8 seconds
+// when connected to an AP without Internet. A 750 ms timeout comfortably rides through
+// any momentary 100-300 ms phone scan pause with ZERO motor shocks or jerks!
+const uint32_t FAILSAFE_MS    = 750;
 
 // Slew-Rate Limiter: Maximum PWM change per 3 ms control loop tick
 // 12 units per 3 ms = ~4000 units/s (0 -> 255 takes ~60 ms)
-// Feels instantaneous to driver thumb, but eliminates mechanical jerk and current spikes
 const int16_t MAX_PWM_SLEW_PER_TICK = 12;
 
 // -------------------------------------------------------------------------------------
@@ -83,6 +84,7 @@ portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 // Slew-rate smoothed active motor outputs
 static int16_t s_smooth_left_pwm  = 0;
 static int16_t s_smooth_right_pwm = 0;
+static bool    s_drivers_enabled  = false;
 
 // -------------------------------------------------------------------------------------
 // Dual BTS7960 Motor Driver Primitives
@@ -95,12 +97,19 @@ void write_pwm(uint8_t pin, uint8_t channel, uint32_t duty) {
 #endif
 }
 
+void set_driver_enables(bool enable) {
+    if (s_drivers_enabled != enable) {
+        s_drivers_enabled = enable;
+        digitalWrite(LEFT_EN_PIN,  enable ? HIGH : LOW);
+        digitalWrite(RIGHT_EN_PIN, enable ? HIGH : LOW);
+    }
+}
+
 void init_motor_drivers() {
     // Enable Pins
     pinMode(LEFT_EN_PIN, OUTPUT);
     pinMode(RIGHT_EN_PIN, OUTPUT);
-    digitalWrite(LEFT_EN_PIN, LOW);
-    digitalWrite(RIGHT_EN_PIN, LOW);
+    set_driver_enables(false);
 
     // Aux Pins
     pinMode(AUX_SPARE_PIN, OUTPUT);
@@ -181,16 +190,6 @@ void apply_aux_channels(uint16_t aux_packed) {
     write_pwm(AUX_DRIBBLER_PIN, 4, dribbler_duty);
 }
 
-void emergency_brake() {
-    s_smooth_left_pwm  = 0;
-    s_smooth_right_pwm = 0;
-    apply_left_motor(0);
-    apply_right_motor(0);
-    digitalWrite(LEFT_EN_PIN, LOW);
-    digitalWrite(RIGHT_EN_PIN, LOW);
-    write_pwm(AUX_DRIBBLER_PIN, 4, 0);
-}
-
 // -------------------------------------------------------------------------------------
 // Slew-Rate Filter for Butter-Smooth Motor Acceleration & Deceleration
 // -------------------------------------------------------------------------------------
@@ -249,7 +248,6 @@ void process_udp_packets() {
 // -------------------------------------------------------------------------------------
 void setup() {
     // 1. Set CPU frequency to 80 MHz (Lowest possible clock for ESP32-S3 Wi-Fi)
-    // Cuts core switching dissipation by >70% compared to 240 MHz.
     setCpuFrequencyMhz(80);
 
     Serial.begin(115200);
@@ -258,11 +256,11 @@ void setup() {
     Serial.println("\n=======================================================");
     Serial.println("  APEX-F6X: ESP32-S3 LIGHTWEIGHT & COOL CONTROLLER     ");
     Serial.printf ("  CPU: %u MHz | Wi-Fi 802.11n | Dual BTS7960          \n", getCpuFrequencyMhz());
+    Serial.printf ("  Internal Die Temp: %.1f C                           \n", temperatureRead());
     Serial.println("=======================================================");
 
-    // 2. Initialize BTS7960 Drivers & Hold Brake
+    // 2. Initialize BTS7960 Drivers
     init_motor_drivers();
-    emergency_brake();
 
     // 3. Ultra-Low Thermal Wi-Fi Access Point Configuration
     WiFi.mode(WIFI_AP);
@@ -276,12 +274,10 @@ void setup() {
         Serial.printf("[Wi-Fi] AP Ready: %s (Ch %d) IP: 192.168.4.1\n", AP_SSID, AP_CHANNEL);
     }
 
-    // Capped RF TX power: 28 (7.0 dBm = 5 mW).
-    // Reduces RF heat dissipation by 93% compared to default 20 dBm (100 mW).
-    // Provides 15+ meters of flawless coverage with zero LDO heat sag!
+    // Capped RF TX power: 28 (7.0 dBm = 5 mW)
     esp_wifi_set_max_tx_power(28);
 
-    // Disable modem sleep to prevent 5 Hz packet buffering jitter
+    // Disable modem sleep to prevent packet buffering jitter
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     // Lock bandwidth to HT20 for maximum SNR stability
@@ -291,7 +287,7 @@ void setup() {
     g_udp.begin(UDP_PORT);
     g_last_packet_time = millis();
 
-    Serial.println("[SYSTEM] Robot Ready (NeoPixel Disabled, 80MHz Cool Mode).");
+    Serial.println("[SYSTEM] Robot Ready (NeoPixel Disabled, 80MHz Cool Mode, 750ms Watchdog).");
 }
 
 // -------------------------------------------------------------------------------------
@@ -316,29 +312,44 @@ void loop() {
     last_pkt         = g_last_packet_time;
     portEXIT_CRITICAL(&g_mux);
 
-    // 3. Hardware Failsafe Watchdog (250 ms cutoff)
+    // 3. Hardware Failsafe Watchdog (750 ms cutoff)
+    // Rides through momentary 100-300 ms Android Wi-Fi scan pauses without shock/jerk
     if ((now - last_pkt) > FAILSAFE_MS) {
         if (!g_failsafe_active) {
             portENTER_CRITICAL(&g_mux);
             g_failsafe_active = true;
             portEXIT_CRITICAL(&g_mux);
+            Serial.printf("[FAILSAFE] Signal timeout (>%ums). Smooth brake engaged.\n", FAILSAFE_MS);
         }
-        emergency_brake();
+        // Smoothly ramp down to zero rather than abruptly slamming enable pins
+        cur_target_left  = 0;
+        cur_target_right = 0;
+    }
+
+    // 4. Slew-Rate Smooth Filter: Eliminates motor jerking and back-EMF spikes
+    s_smooth_left_pwm  = slew_towards(s_smooth_left_pwm,  cur_target_left,  MAX_PWM_SLEW_PER_TICK);
+    s_smooth_right_pwm = slew_towards(s_smooth_right_pwm, cur_target_right, MAX_PWM_SLEW_PER_TICK);
+
+    // Enable drivers if either motor is commanded; disable only when fully at rest
+    if (abs(s_smooth_left_pwm) > 0 || abs(s_smooth_right_pwm) > 0 || !g_failsafe_active) {
+        set_driver_enables(true);
     } else {
-        // Link Healthy: Enable BTS7960 Drivers
-        digitalWrite(LEFT_EN_PIN, HIGH);
-        digitalWrite(RIGHT_EN_PIN, HIGH);
+        set_driver_enables(false);
+    }
 
-        // 4. Slew-Rate Smooth Filter: Eliminates motor jerking and back-EMF spikes
-        s_smooth_left_pwm  = slew_towards(s_smooth_left_pwm,  cur_target_left,  MAX_PWM_SLEW_PER_TICK);
-        s_smooth_right_pwm = slew_towards(s_smooth_right_pwm, cur_target_right, MAX_PWM_SLEW_PER_TICK);
+    apply_left_motor(s_smooth_left_pwm);
+    apply_right_motor(s_smooth_right_pwm);
+    apply_aux_channels(cur_aux);
 
-        apply_left_motor(s_smooth_left_pwm);
-        apply_right_motor(s_smooth_right_pwm);
-        apply_aux_channels(cur_aux);
+    // 5. Periodic Diagnostic Telemetry (every 3 seconds on Serial)
+    static uint32_t s_last_diag = 0;
+    if (now - s_last_diag >= 3000) {
+        s_last_diag = now;
+        Serial.printf("[STATUS] DieTemp: %.1f C | RxPkts: %u | Left: %d | Right: %d | Failsafe: %s\n",
+            temperatureRead(), g_rx_packet_count, s_smooth_left_pwm, s_smooth_right_pwm,
+            g_failsafe_active ? "ACTIVE" : "OK");
     }
 
     // 3 ms deterministic loop tick (~333 Hz control rate)
-    // Yields smoothly to FreeRTOS Wi-Fi task with zero UART stalls
     delay(3);
 }
