@@ -26,7 +26,7 @@ sealed class CheckUpdateResult {
 }
 
 object AppUpdateManager {
-    const val CURRENT_APP_VERSION = "1.0.6"
+    const val CURRENT_APP_VERSION = "1.0.7"
     const val DEFAULT_REPO = "anik-creates/robosoccer-f6x"
 
     suspend fun checkLatestRelease(repo: String = DEFAULT_REPO): CheckUpdateResult = withContext(Dispatchers.IO) {

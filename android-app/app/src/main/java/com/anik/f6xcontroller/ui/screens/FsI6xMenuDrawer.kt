@@ -423,7 +423,99 @@ private fun SystemTabContent(
             }
         }
 
-        // 3. Network & Low-Latency Wi-Fi Lock
+        // 3. Motor Speed Balance & Channel Tuning (Left vs Right Track Calibration)
+        item {
+            Text(
+                text = "MOTOR SPEED BALANCE & CHANNEL TUNING",
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 11.sp,
+                letterSpacing = 1.sp,
+                color = PureWhite
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(PillSurface)
+                    .border(1.dp, PillBorderMuted, RoundedCornerShape(12.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                // Left Motor Power Trim
+                MonochromeParameterSlider(
+                    label = "LEFT TRACK MOTOR POWER",
+                    value = tankSettings.leftMotorTrimPercent.toFloat(),
+                    range = 50f..150f,
+                    suffix = "%"
+                ) {
+                    onUpdateTankSettings(tankSettings.copy(leftMotorTrimPercent = it.roundToInt()))
+                }
+
+                // Right Motor Power Trim
+                MonochromeParameterSlider(
+                    label = "RIGHT TRACK MOTOR POWER",
+                    value = tankSettings.rightMotorTrimPercent.toFloat(),
+                    range = 50f..150f,
+                    suffix = "%"
+                ) {
+                    onUpdateTankSettings(tankSettings.copy(rightMotorTrimPercent = it.roundToInt()))
+                }
+
+                // Straight-Line Tracking Trim
+                MonochromeParameterSlider(
+                    label = "STRAIGHT-LINE TRACKING TRIM (BIAS)",
+                    value = tankSettings.steeringTrimOffset.toFloat(),
+                    range = -50f..50f,
+                    suffix = ""
+                ) {
+                    onUpdateTankSettings(tankSettings.copy(steeringTrimOffset = it.roundToInt()))
+                }
+
+                // Stiction / Deadband Compensation
+                MonochromeParameterSlider(
+                    label = "STICTION COMPENSATION (MIN START PWM)",
+                    value = tankSettings.minMotorPwm.toFloat(),
+                    range = 0f..50f,
+                    suffix = " PWM"
+                ) {
+                    onUpdateTankSettings(tankSettings.copy(minMotorPwm = it.roundToInt()))
+                }
+
+                // Reset Balance Button
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(32.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(PureBlack)
+                        .border(1.dp, PillBorderMuted, RoundedCornerShape(8.dp))
+                        .clickable {
+                            onUpdateTankSettings(
+                                tankSettings.copy(
+                                    leftMotorTrimPercent = 100,
+                                    rightMotorTrimPercent = 100,
+                                    steeringTrimOffset = 0,
+                                    minMotorPwm = 0
+                                )
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "↺ RESET MOTOR BALANCE TO 100% / 100% / 0",
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        color = PureWhite
+                    )
+                }
+            }
+        }
+
+        // 4. Network & Low-Latency Wi-Fi Lock
         item {
             Text(
                 text = "ROBOT WI-FI & UDP TARGET",

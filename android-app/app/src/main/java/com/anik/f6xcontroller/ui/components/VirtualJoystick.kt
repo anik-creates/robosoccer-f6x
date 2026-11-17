@@ -31,10 +31,10 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
- * Computes control-assist output with strict deadzone and non-restricting axis snapping.
- * - Radial and per-axis deadzone ensures exact 0.0f output within deadzone.
- * - Axis snapping assists straight driving and spot turns without trapping the user:
- *   finger is freely tracked, and exiting the axis is instant and smooth.
+ * Computes control-assist output with strict deadzone and smooth non-restricting axis snapping.
+ * - Radial deadzone ensures exact 0.0f output within deadzone.
+ * - Smooth cubic Hermite S-curve blending: assists straight driving and spot turns without trapping the user:
+ *   finger is freely tracked, and exiting the axis is completely fluid and continuous.
  */
 fun calculateControlAssist(
     rawX: Float,
@@ -52,54 +52,29 @@ fun calculateControlAssist(
         return Pair(0f, 0f)
     }
 
-    var px = rawX
-    var py = rawY
+    // Rescale radial magnitude smoothly from 0.0f upward outside deadzone
+    val scaledMag = ((dist - dz) / (1.0f - dz)).coerceIn(0f, 1f)
+    val normX = (rawX / dist) * scaledMag
+    val normY = (rawY / dist) * scaledMag
 
-    // 2. Independent axis deadzone:
-    // If lateral steering drift is within deadzone, steer is strictly 0 (rock-solid straight driving!)
-    if (abs(px) <= dz) {
-        px = 0f
-    }
-    // If longitudinal throttle drift is within deadzone, throttle is strictly 0 (rock-solid spot turns!)
-    if (abs(py) <= dz) {
-        py = 0f
-    }
+    var finalX = normX
+    var finalY = normY
 
-    if (px == 0f && py == 0f) {
-        return Pair(0f, 0f)
-    }
-
-    // 3. Control assist (snapping without restriction):
-    // Assist without trapping:
-    // When driving forward/reverse (|rawY| >= snapThresh) and lateral deflection |rawX| < snapThresh:
-    // snap steering to 0 for a laser-straight line.
-    // When doing a spot turn (|rawX| >= snapThresh) and longitudinal deflection |rawY| < snapThresh:
-    // snap throttle to 0 for a pure spot turn.
+    // 2. Control assist (snapping without restriction or trapping):
     if (snapToAxes) {
-        if (abs(rawX) < snapThresh && abs(rawY) >= snapThresh) {
-            px = 0f
+        if (abs(normY) >= snapThresh) {
+            val ratioX = (abs(normX) / snapThresh).coerceIn(0f, 1f)
+            val smoothFactor = ratioX * ratioX * (3.0f - 2.0f * ratioX)
+            finalX = normX * smoothFactor
         }
-        if (abs(rawY) < snapThresh && abs(rawX) >= snapThresh) {
-            py = 0f
+        if (abs(normX) >= snapThresh) {
+            val ratioY = (abs(normY) / snapThresh).coerceIn(0f, 1f)
+            val smoothFactor = ratioY * ratioY * (3.0f - 2.0f * ratioY)
+            finalY = normY * smoothFactor
         }
     }
 
-    // 4. Smooth linear scaling so there is no sudden jump when exiting deadzone or snap zone
-    val outX = if (px == 0f) 0f else {
-        val sign = if (px > 0f) 1f else -1f
-        val thresh = if (snapToAxes && abs(rawX) < snapThresh) snapThresh else dz
-        val mag = if (thresh < 1f) ((abs(px) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
-        sign * mag
-    }
-
-    val outY = if (py == 0f) 0f else {
-        val sign = if (py > 0f) 1f else -1f
-        val thresh = if (snapToAxes && abs(rawY) < snapThresh) snapThresh else dz
-        val mag = if (thresh < 1f) ((abs(py) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
-        sign * mag
-    }
-
-    return Pair(outX.coerceIn(-1f, 1f), outY.coerceIn(-1f, 1f))
+    return Pair(finalX.coerceIn(-1f, 1f), finalY.coerceIn(-1f, 1f))
 }
 
 @Composable
@@ -170,7 +145,8 @@ fun VirtualJoystick(
 
                             val (outX, outY) = calculateControlAssist(rawX, rawY, deadzone, snapToAxes, snapThreshold)
                             thumbOffset = Offset(outX * maxTravel, -outY * maxTravel)
-                            onValueChange(outX, outY)
+                            // Send raw stick inputs so FsI6xMixer applies the mathematical DSP pipeline once
+                            onValueChange(rawX, rawY)
                         }
 
                         handlePointer(down.position)

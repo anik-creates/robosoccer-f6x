@@ -62,7 +62,7 @@ const int   UDP_PORT          = 4210;
 
 const uint32_t PWM_FREQ       = 20000; // 20 kHz ultrasonic (silent operation)
 const uint8_t  PWM_RESOLUTION = 8;     // 8-bit resolution (0..255)
-const uint32_t FAILSAFE_MS    = 150;   // 150 ms link timeout failsafe
+const uint32_t FAILSAFE_MS    = 250;   // 250 ms failsafe timeout (prevents jitter tripping)
 
 // -------------------------------------------------------------------------------------
 // Global State & RTOS Mutex
@@ -86,7 +86,7 @@ portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 // -------------------------------------------------------------------------------------
 void init_status_led() {
     pinMode(21, OUTPUT);
-    digitalWrite(21, LOW); // Separate blue onboard LED kept OFF
+    digitalWrite(21, LOW); // Separate blue onboard LED kept permanently OFF
     neopixelWrite(48, 0, 0, 0); // Start OFF
 }
 
@@ -97,67 +97,106 @@ void set_status_led(uint8_t r, uint8_t g, uint8_t b) {
 /**
  * Visual Debugger on NeoPixel RGB LED:
  * - Throttle Zero / Idle / Failsafe : LED Turned OFF
- * - Forward   : GREEN  (Brightness scales with throttle 0..255)
- * - Reverse   : RED    (Brightness scales with throttle 0..255)
- * - Turn Right: PURPLE (Brightness scales with steering 0..255)
- * - Turn Left : YELLOW (Brightness scales with steering 0..255)
+ * - Forward   : GREEN  (Brightness scales smoothly with throttle 0..255)
+ * - Reverse   : RED    (Brightness scales smoothly with throttle 0..255)
+ * - Turn Right: PURPLE (Magenta: Red + Blue, brightness scales with steering 0..255)
+ * - Turn Left : YELLOW (Red + Green, brightness scales with steering 0..255)
+ *
+ * Smoothness & Anti-Flicker Engineering:
+ * - Rate-limited to 30 Hz (33 ms) to prevent RMT channel collisions with Wi-Fi interrupts
+ * - Low-pass IIR exponential filter for butter-smooth color & brightness transitions
+ * - Dual-threshold hysteresis (6 vs 12) prevents edge flickering around zero throttle
+ * - Hardware RMT write only called when quantized RGB output changes
  */
 void update_motor_status_led(int16_t left_pwm, int16_t right_pwm, bool is_failsafe) {
-    static uint8_t s_last_r = 255, s_last_g = 255, s_last_b = 255;
+    static uint32_t s_last_led_update = 0;
+    static float s_filt_r = 0.0f;
+    static float s_filt_g = 0.0f;
+    static float s_filt_b = 0.0f;
+    static uint8_t s_sent_r = 0, s_sent_g = 0, s_sent_b = 0;
+    static bool s_was_active = false;
 
-    // 1. Throttle is zero / stopped / idle / failsafe -> LED TURNED OFF
-    if (is_failsafe || (abs(left_pwm) < 8 && abs(right_pwm) < 8)) {
-        if (s_last_r != 0 || s_last_g != 0 || s_last_b != 0) {
-            s_last_r = 0; s_last_g = 0; s_last_b = 0;
-            set_status_led(0, 0, 0);
-        }
+    uint32_t now = millis();
+    // 30 Hz maximum rate limit (33 ms): eliminates RMT contention with Wi-Fi stack
+    if (now - s_last_led_update < 33) {
         return;
     }
+    s_last_led_update = now;
 
-    // 2. Decompose Tank speeds into Forward/Reverse and Steering components
-    int32_t fwd_comp  = ((int32_t)left_pwm + (int32_t)right_pwm) / 2;
-    int32_t turn_comp = ((int32_t)left_pwm - (int32_t)right_pwm) / 2;
+    // Dual-threshold hysteresis: if already active require < 6 to stop; if idle require >= 12 to start
+    int16_t thresh = s_was_active ? 6 : 12;
+    bool is_idle = is_failsafe || (abs(left_pwm) < thresh && abs(right_pwm) < thresh);
 
-    int32_t abs_fwd  = abs(fwd_comp);
-    int32_t abs_turn = abs(turn_comp);
+    float target_r = 0.0f;
+    float target_g = 0.0f;
+    float target_b = 0.0f;
 
-    uint8_t r = 0, g = 0, b = 0;
+    if (!is_idle) {
+        s_was_active = true;
+        // Decompose Tank speeds into Forward/Reverse and Steering components
+        int32_t fwd_comp  = ((int32_t)left_pwm + (int32_t)right_pwm) / 2;
+        int32_t turn_comp = ((int32_t)left_pwm - (int32_t)right_pwm) / 2;
 
-    if (abs_fwd >= abs_turn) {
-        // Forward / Reverse motion dominates
-        uint8_t bri = (uint8_t)constrain(abs_fwd, 15, 255);
-        if (fwd_comp > 0) {
-            // FORWARD: GREEN (brightness according to throttle)
-            r = 0;
-            g = bri;
-            b = 0;
+        int32_t abs_fwd  = abs(fwd_comp);
+        int32_t abs_turn = abs(turn_comp);
+
+        if (abs_fwd >= abs_turn) {
+            // Forward / Reverse motion dominates
+            float bri = (float)constrain(abs_fwd, 20, 255);
+            if (fwd_comp > 0) {
+                // FORWARD: GREEN (brightness according to throttle)
+                target_r = 0.0f;
+                target_g = bri;
+                target_b = 0.0f;
+            } else {
+                // REVERSE: RED (brightness according to throttle)
+                target_r = bri;
+                target_g = 0.0f;
+                target_b = 0.0f;
+            }
         } else {
-            // REVERSE: RED (brightness according to throttle)
-            r = bri;
-            g = 0;
-            b = 0;
+            // Steering / Turning motion dominates
+            float bri = (float)constrain(abs_turn, 20, 255);
+            if (turn_comp > 0) {
+                // RIGHT: PURPLE (Magenta: Red + Blue, brightness according to steer)
+                target_r = bri;
+                target_g = 0.0f;
+                target_b = bri;
+            } else {
+                // LEFT: YELLOW (Red + Green, brightness according to steer)
+                target_r = bri;
+                target_g = bri;
+                target_b = 0.0f;
+            }
         }
     } else {
-        // Steering / Turning motion dominates
-        uint8_t bri = (uint8_t)constrain(abs_turn, 15, 255);
-        if (turn_comp > 0) {
-            // RIGHT: PURPLE (Magenta: Red + Blue, brightness according to steer)
-            r = bri;
-            g = 0;
-            b = bri;
-        } else {
-            // LEFT: YELLOW (Red + Green, brightness according to steer)
-            r = bri;
-            g = bri;
-            b = 0;
-        }
+        s_was_active = false;
+        // Idle / Failsafe: Fade cleanly to OFF
+        target_r = 0.0f;
+        target_g = 0.0f;
+        target_b = 0.0f;
     }
 
-    if (abs((int)r - (int)s_last_r) > 2 || abs((int)g - (int)s_last_g) > 2 || abs((int)b - (int)s_last_b) > 2) {
-        s_last_r = r;
-        s_last_g = g;
-        s_last_b = b;
-        set_status_led(r, g, b);
+    // Exponential smoothing filter (65% history, 35% new target)
+    s_filt_r = s_filt_r * 0.65f + target_r * 0.35f;
+    s_filt_g = s_filt_g * 0.65f + target_g * 0.35f;
+    s_filt_b = s_filt_b * 0.65f + target_b * 0.35f;
+
+    // Hard cutoff to pure zero when very close to stop
+    if (s_filt_r < 3.0f && target_r == 0.0f) s_filt_r = 0.0f;
+    if (s_filt_g < 3.0f && target_g == 0.0f) s_filt_g = 0.0f;
+    if (s_filt_b < 3.0f && target_b == 0.0f) s_filt_b = 0.0f;
+
+    uint8_t out_r = (uint8_t)constrain((int)s_filt_r, 0, 255);
+    uint8_t out_g = (uint8_t)constrain((int)s_filt_g, 0, 255);
+    uint8_t out_b = (uint8_t)constrain((int)s_filt_b, 0, 255);
+
+    // Call hardware RMT driver ONLY if the output color bytes have changed
+    if (out_r != s_sent_r || out_g != s_sent_g || out_b != s_sent_b) {
+        s_sent_r = out_r;
+        s_sent_g = out_g;
+        s_sent_b = out_b;
+        neopixelWrite(48, out_r, out_g, out_b);
     }
 }
 

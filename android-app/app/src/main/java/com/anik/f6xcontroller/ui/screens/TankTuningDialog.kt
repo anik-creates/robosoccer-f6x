@@ -248,7 +248,90 @@ fun TankTuningDialog(
                 onUpdateTankSettings(tankSettings.copy(steeringSensitivity = it.roundToInt()))
             }
 
-            // Section 7: Inversion & Center Snap Toggles
+            // Section 7: Motor Speed Balancing & Channel Tuning
+            Text(
+                text = "MOTOR SPEED BALANCE & CHANNEL TUNING",
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 11.sp,
+                letterSpacing = 1.sp,
+                color = PureWhite
+            )
+
+            // Left Motor Power Trim
+            TuningSlider(
+                title = "LEFT TRACK MOTOR POWER TRIM",
+                description = "Fine-tune left side BTS7960 power to compensate for motor or gearbox speed differences",
+                value = tankSettings.leftMotorTrimPercent.toFloat(),
+                range = 50f..150f,
+                suffix = "%"
+            ) {
+                onUpdateTankSettings(tankSettings.copy(leftMotorTrimPercent = it.roundToInt()))
+            }
+
+            // Right Motor Power Trim
+            TuningSlider(
+                title = "RIGHT TRACK MOTOR POWER TRIM",
+                description = "Fine-tune right side BTS7960 power to compensate for motor or gearbox speed differences",
+                value = tankSettings.rightMotorTrimPercent.toFloat(),
+                range = 50f..150f,
+                suffix = "%"
+            ) {
+                onUpdateTankSettings(tankSettings.copy(rightMotorTrimPercent = it.roundToInt()))
+            }
+
+            // Straight-Line Tracking Trim (Bias)
+            TuningSlider(
+                title = "STRAIGHT-LINE TRACKING TRIM (CENTER BIAS)",
+                description = "Compensates for track drift so robot drives laser-straight on throttle (+ pulls right, - pulls left)",
+                value = tankSettings.steeringTrimOffset.toFloat(),
+                range = -50f..50f,
+                suffix = ""
+            ) {
+                onUpdateTankSettings(tankSettings.copy(steeringTrimOffset = it.roundToInt()))
+            }
+
+            // Stiction / Deadband Compensation
+            TuningSlider(
+                title = "STICTION COMPENSATION (MIN START PWM)",
+                description = "Minimum starting PWM to overcome mechanical gearbox static friction and eliminate dead time",
+                value = tankSettings.minMotorPwm.toFloat(),
+                range = 0f..50f,
+                suffix = " PWM"
+            ) {
+                onUpdateTankSettings(tankSettings.copy(minMotorPwm = it.roundToInt()))
+            }
+
+            // Quick Reset Balance Button
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(34.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(PillSurface)
+                    .border(1.dp, PillBorderMuted, RoundedCornerShape(8.dp))
+                    .clickable {
+                        onUpdateTankSettings(
+                            tankSettings.copy(
+                                leftMotorTrimPercent = 100,
+                                rightMotorTrimPercent = 100,
+                                steeringTrimOffset = 0,
+                                minMotorPwm = 0
+                            )
+                        )
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "↺ RESET MOTOR BALANCE TO DEFAULTS (100% / 100% / 0)",
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 10.sp,
+                    color = PureWhite
+                )
+            }
+
+            // Section 8: Inversion & Center Snap Toggles
             Column(
                 modifier = Modifier
                     .fillMaxWidth()

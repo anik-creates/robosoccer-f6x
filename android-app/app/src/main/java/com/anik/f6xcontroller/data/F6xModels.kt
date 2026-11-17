@@ -20,7 +20,7 @@ enum class MixingMode(val label: String) {
 }
 
 /**
- * Tank Drive Control, Snapping, Expo & Speed Limiter Settings.
+ * Tank Drive Control, Snapping, Expo, Speed Limiter & Channel Tuning Settings.
  */
 data class TankControlSettings(
     val maxSpeedPercent: Int = 100,          // 20% to 100% (Speed Limiter / Governor)
@@ -32,7 +32,12 @@ data class TankControlSettings(
     val invertSteering: Boolean = false,     // Invert Left/Right steering
     val invertThrottle: Boolean = false,     // Invert Forward/Reverse throttle
     val leftStickSnapCenter: Boolean = true, // Snap left stick to center (0,0) when released
-    val githubRepo: String = "anik-creates/robosoccer-f6x" // Target GitHub repo for updates
+    val githubRepo: String = "anik-creates/robosoccer-f6x", // Target GitHub repo for updates
+    // --- Channel Balancing & Speed Discrepancy Compensation ---
+    val leftMotorTrimPercent: Int = 100,     // 50% to 150% (Default 100%): Scales left track motor power
+    val rightMotorTrimPercent: Int = 100,    // 50% to 150% (Default 100%): Scales right track motor power
+    val steeringTrimOffset: Int = 0,         // -50 to +50 (Default 0): Straight-line tracking bias / trim
+    val minMotorPwm: Int = 0                 // 0 to 60 (Default 0): Stiction compensation / start threshold
 )
 
 /**

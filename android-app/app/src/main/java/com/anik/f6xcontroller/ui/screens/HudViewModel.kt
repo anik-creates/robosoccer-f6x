@@ -99,6 +99,10 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile
     private var fallbackDatagramSocket: DatagramSocket? = null
     private var javaTxSeq: Short = 0
+    private var javaTxCount: Long = 0L
+    private var javaAckCount: Long = 0L
+    private var lastRttMs: Float = 0f
+    private val txTimestamps = java.util.concurrent.ConcurrentHashMap<Short, Long>()
 
     private fun getSubnetDatagramSocket(): DatagramSocket? {
         try {
@@ -117,6 +121,7 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
                                 soTimeout = 10
                             }
                             subnetDatagramSocket = s
+                            startReceiveLoop(s)
                             return s
                         }
                     }
@@ -149,13 +154,11 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
 
         // 1. Initialize native C++ UDP Engine
         NativeUdpBridge.init(connectionSettings.value.ip, connectionSettings.value.port)
-        NativeUdpBridge.start()
 
         // 2. Wire up Wi-Fi network binding callback: when phone connects to robot AP,
         // restart native socket and bind Java DatagramSocket to the Wi-Fi network
         wifiLockManager.onNetworkBound = { network ->
             Log.i("HudViewModel", "Wi-Fi network bound ($network). Re-binding sockets...")
-            NativeUdpBridge.restart()
             bindJavaDatagramSocket(network)
         }
 
@@ -209,17 +212,17 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
                 // D. Pack Aux Channels (CH5..CH10)
                 val auxPacked = FsI6xMixer.packAux(auxMap)
 
-                // E. Path 1: Pass to native C++ NDK Engine via JNI
+                // E. Path 1: Update native NDK state
                 NativeUdpBridge.updateControls(leftPwm, rightPwm, auxPacked)
 
                 // F. Path 2: Direct Java DatagramSocket transmission (bound to Wi-Fi network)
                 sendViaJavaSocket(conn.ip, conn.port, leftPwm, rightPwm, auxPacked)
 
-                // G. Update telemetry state
+                // G. Update telemetry state (accurate live stats from network-bound socket)
                 _telemetry.value = TelemetryStats(
-                    txCount = NativeUdpBridge.getTxCount(),
-                    ackCount = NativeUdpBridge.getAckCount(),
-                    lastRttMs = NativeUdpBridge.getLastRttMs(),
+                    txCount = javaTxCount,
+                    ackCount = javaAckCount,
+                    lastRttMs = lastRttMs,
                     leftPwm = leftPwm,
                     rightPwm = rightPwm,
                     auxPacked = auxPacked
@@ -238,28 +241,38 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             socket.soTimeout = 10
             boundDatagramSocket = socket
             Log.i("HudViewModel", "Java DatagramSocket successfully bound to network: $network")
-
-            // Start background receiver for 4-byte ACKs on bound socket
-            viewModelScope.launch(Dispatchers.IO) {
-                val rxBuf = ByteArray(32)
-                val rxPacket = DatagramPacket(rxBuf, rxBuf.size)
-                while (isActive && boundDatagramSocket == socket && !socket.isClosed) {
-                    try {
-                        socket.receive(rxPacket)
-                        if (rxPacket.length >= 4) {
-                            val magic = (rxBuf[0].toInt() and 0xFF) or ((rxBuf[1].toInt() and 0xFF) shl 8)
-                            if (magic == 0x55AA) {
-                                // ACK received! ESP32-S3 is online and receiving packets!
-                                wifiLockManager.checkExistingWifiConnection()
-                            }
-                        }
-                    } catch (_: Exception) {
-                        // SocketTimeoutException expected on non-blocking receive
-                    }
-                }
-            }
+            startReceiveLoop(socket)
         } catch (e: Exception) {
             Log.e("HudViewModel", "Failed to bind Java DatagramSocket: ${e.message}")
+        }
+    }
+
+    private fun startReceiveLoop(socket: DatagramSocket) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val rxBuf = ByteArray(32)
+            val rxPacket = DatagramPacket(rxBuf, rxBuf.size)
+            while (isActive && !socket.isClosed) {
+                try {
+                    socket.receive(rxPacket)
+                    if (rxPacket.length >= 4) {
+                        val magic = (rxBuf[0].toInt() and 0xFF) or ((rxBuf[1].toInt() and 0xFF) shl 8)
+                        if (magic == 0x55AA) {
+                            val ackSeq = ((rxBuf[2].toInt() and 0xFF) or ((rxBuf[3].toInt() and 0xFF) shl 8)).toShort()
+                            val sendTime = txTimestamps.remove(ackSeq)
+                            if (sendTime != null) {
+                                val rtt = (System.currentTimeMillis() - sendTime).toFloat()
+                                if (rtt in 0f..500f) {
+                                    lastRttMs = rtt
+                                }
+                            }
+                            javaAckCount++
+                            wifiLockManager.checkExistingWifiConnection()
+                        }
+                    }
+                } catch (_: Exception) {
+                    // SocketTimeoutException expected on non-blocking receive
+                }
+            }
         }
     }
 
@@ -291,34 +304,29 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             val targetIp = if (ip.isBlank()) "192.168.4.1" else ip
             val targetAddr = InetAddress.getByName(targetIp)
             val packet = DatagramPacket(bytes, 12, targetAddr, port)
-            val bcastAddr = InetAddress.getByName("192.168.4.255")
-            val bcastPacket = DatagramPacket(bytes, 12, bcastAddr, port)
 
-            // A. Send via subnet socket bound directly to 192.168.4.x (bypasses any mobile data)
-            getSubnetDatagramSocket()?.let { s ->
-                try {
-                    s.send(packet)
-                    s.send(bcastPacket)
-                } catch (e: Exception) {
-                    Log.w("HudViewModel", "Subnet socket send error: ${e.message}")
-                }
+            // Select single best socket to prevent duplicate packet flooding and WiFi contention:
+            val activeSocket = when {
+                boundDatagramSocket != null && !boundDatagramSocket!!.isClosed -> boundDatagramSocket
+                getSubnetDatagramSocket() != null -> getSubnetDatagramSocket()
+                else -> fallbackDatagramSocket
             }
 
-            // B. Send via Android Network-bound socket
-            boundDatagramSocket?.let { s ->
+            activeSocket?.let { s ->
                 try {
                     s.send(packet)
-                    s.send(bcastPacket)
-                } catch (e: Exception) {
-                    Log.w("HudViewModel", "Bound socket send error: ${e.message}")
-                }
-            }
+                    javaTxCount++
+                    txTimestamps[javaTxSeq] = System.currentTimeMillis()
 
-            // C. Send via fallback socket
-            fallbackDatagramSocket?.let { s ->
-                try {
-                    s.send(packet)
-                } catch (_: Exception) {}
+                    // Broadcast only once every 128 packets (~1.28s) for background discovery
+                    if ((javaTxSeq.toInt() and 0x7F) == 0) {
+                        val bcastAddr = InetAddress.getByName("192.168.4.255")
+                        val bcastPacket = DatagramPacket(bytes, 12, bcastAddr, port)
+                        s.send(bcastPacket)
+                    }
+                } catch (e: Exception) {
+                    Log.w("HudViewModel", "Socket send error: ${e.message}")
+                }
             }
         } catch (e: Exception) {
             Log.e("HudViewModel", "sendViaJavaSocket error: ${e.message}")

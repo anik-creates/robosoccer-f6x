@@ -26,12 +26,12 @@ object FsI6xMixer {
 
     /**
      * Applies Cardinal Axis Snapping & Deadzone filter:
-     * - Strict Deadzone: both radial (hypot <= dz) and per-axis (|x| <= dz, |y| <= dz)
-     *   ensuring the stick outputs EXACTLY 0.0f within the deadzone with zero drift or motor creep.
-     * - Control-Assist Axis Snapping:
-     *   * If driving forward/reverse (|y| >= snapThreshold) and lateral drift |x| < snapThreshold: X snaps to 0.0f
-     *   * If doing a spot turn (|x| >= snapThreshold) and longitudinal drift |y| < snapThreshold: Y snaps to 0.0f
-     *   * Freedom of movement: user is never restricted or stuck when switching axes.
+     * - Strict Deadzone: radial (hypot <= dz) ensuring the stick outputs EXACTLY 0.0f
+     *   within the deadzone with zero drift or motor creep.
+     * - Smooth Control-Assist Axis Snapping:
+     *   * S-curve cubic Hermite blending: smoothly attenuates lateral drift when driving forward/backward
+     *     and longitudinal drift when turning.
+     *   * Never restricts or traps the user: transitioning across axes is 100% fluid and continuous.
      */
     fun applySnappingAndDeadzone(
         x: Float,
@@ -41,55 +41,39 @@ object FsI6xMixer {
         val dz = settings.deadzone.coerceIn(0.0f, 0.40f)
         val snapThresh = settings.snapThreshold.coerceIn(0.02f, 0.40f)
 
-        // 1. Center radial deadzone check: inside circle -> strictly (0, 0)
+        // 1. Center radial deadzone check: strictly (0, 0) inside circle
         val dist = hypot(x, y)
         if (dist <= dz) {
             return Pair(0f, 0f)
         }
 
-        var px = x
-        var py = y
+        // Rescale radial magnitude smoothly from 0.0f upward outside deadzone (no step jump)
+        val scaledMag = ((dist - dz) / (1.0f - dz)).coerceIn(0f, 1f)
+        val normX = (x / dist) * scaledMag
+        val normY = (y / dist) * scaledMag
 
-        // 2. Per-axis deadzone:
-        // If steering is within deadzone -> 0 (laser-straight forward/reverse)
-        if (abs(px) <= dz) {
-            px = 0f
-        }
-        // If throttle is within deadzone -> 0 (pure spot turn)
-        if (abs(py) <= dz) {
-            py = 0f
-        }
+        var finalX = normX
+        var finalY = normY
 
-        if (px == 0f && py == 0f) {
-            return Pair(0f, 0f)
-        }
-
-        // 3. Control assist (snapping without restriction):
+        // 2. Control assist (snapping without restriction or trapping):
         if (settings.snapToAxes) {
-            if (abs(x) < snapThresh && abs(y) >= snapThresh) {
-                px = 0f
+            // When driving predominantly forward/reverse (|normY| >= snapThresh):
+            // Smoothly guide lateral drift towards 0 with an S-curve transition
+            if (abs(normY) >= snapThresh) {
+                val ratioX = (abs(normX) / snapThresh).coerceIn(0f, 1f)
+                val smoothFactor = ratioX * ratioX * (3.0f - 2.0f * ratioX) // Smooth Hermite S-curve
+                finalX = normX * smoothFactor
             }
-            if (abs(y) < snapThresh && abs(x) >= snapThresh) {
-                py = 0f
+            // When turning/spinning (|normX| >= snapThresh):
+            // Smoothly guide longitudinal drift towards 0 with an S-curve transition
+            if (abs(normX) >= snapThresh) {
+                val ratioY = (abs(normY) / snapThresh).coerceIn(0f, 1f)
+                val smoothFactor = ratioY * ratioY * (3.0f - 2.0f * ratioY) // Smooth Hermite S-curve
+                finalY = normY * smoothFactor
             }
         }
 
-        // 4. Smooth linear scaling so there is no step jump
-        val outX = if (px == 0f) 0f else {
-            val sign = if (px > 0f) 1f else -1f
-            val thresh = if (settings.snapToAxes && abs(x) < snapThresh) snapThresh else dz
-            val mag = if (thresh < 1f) ((abs(px) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
-            sign * mag
-        }
-
-        val outY = if (py == 0f) 0f else {
-            val sign = if (py > 0f) 1f else -1f
-            val thresh = if (settings.snapToAxes && abs(y) < snapThresh) snapThresh else dz
-            val mag = if (thresh < 1f) ((abs(py) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
-            sign * mag
-        }
-
-        return Pair(outX.coerceIn(-1f, 1f), outY.coerceIn(-1f, 1f))
+        return Pair(finalX.coerceIn(-1f, 1f), finalY.coerceIn(-1f, 1f))
     }
 
     /**
@@ -197,9 +181,13 @@ object FsI6xMixer {
 
         val speedLimit = (tankSettings.maxSpeedPercent / 100.0f).coerceIn(0.1f, 1.0f)
         val steerSens = (tankSettings.steeringSensitivity / 100.0f).coerceIn(0.2f, 1.0f)
+        val leftScale = (tankSettings.leftMotorTrimPercent / 100.0f).coerceIn(0.5f, 1.5f)
+        val rightScale = (tankSettings.rightMotorTrimPercent / 100.0f).coerceIn(0.5f, 1.5f)
 
         var effThrottle = if (tankSettings.invertThrottle) -throttle else throttle
-        var effSteering = (if (tankSettings.invertSteering) -steering else steering) * steerSens
+        // Straight-line tracking bias (trim) active when throttle is non-zero
+        val bias = if (throttle != 0f) (tankSettings.steeringTrimOffset / 100.0f) else 0f
+        var effSteering = ((if (tankSettings.invertSteering) -steering else steering) + bias) * steerSens
 
         // Apply Tank Global Exponential Curve if configured
         if (tankSettings.expoPercent != 0) {
@@ -207,6 +195,8 @@ object FsI6xMixer {
             effThrottle = ((1.0f - expo) * effThrottle + expo * (effThrottle * effThrottle * effThrottle)).coerceIn(-1.0f, 1.0f)
             effSteering = ((1.0f - expo) * effSteering + expo * (effSteering * effSteering * effSteering)).coerceIn(-1.0f, 1.0f)
         }
+
+        val minPwm = tankSettings.minMotorPwm.coerceIn(0, 60)
 
         return when (mixingMode) {
             MixingMode.ARCADE -> {
@@ -218,20 +208,46 @@ object FsI6xMixer {
 
                 // Smooth magnitude normalization so blended turns don't clip
                 val maxMag = maxOf(abs(rawLeft), abs(rawRight), 1.0f)
-                val left = (rawLeft / maxMag) * speedLimit
-                val right = (rawRight / maxMag) * speedLimit
+                var leftVal = (rawLeft / maxMag) * speedLimit * leftScale
+                var rightVal = (rawRight / maxMag) * speedLimit * rightScale
 
-                val leftPwm = (left * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
-                val rightPwm = (right * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
+                // Stiction / Deadband compensation (minMotorPwm)
+                if (minPwm > 0) {
+                    if (abs(leftVal) > 0.01f) {
+                        val sign = if (leftVal > 0) 1f else -1f
+                        leftVal = sign * ((minPwm / 255.0f) + abs(leftVal) * ((255 - minPwm) / 255.0f))
+                    }
+                    if (abs(rightVal) > 0.01f) {
+                        val sign = if (rightVal > 0) 1f else -1f
+                        rightVal = sign * ((minPwm / 255.0f) + abs(rightVal) * ((255 - minPwm) / 255.0f))
+                    }
+                }
+
+                val leftPwm = (leftVal * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
+                val rightPwm = (rightVal * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
                 Pair(leftPwm, rightPwm)
             }
             MixingMode.DUAL_TANK -> {
                 // Direct Twin-Stick Tank: Left Stick Y = Left Motor, Right Stick Y = Right Motor
-                val leftInput = if (tankSettings.invertThrottle) -leftStickY else leftStickY
-                val rightInput = if (tankSettings.invertThrottle) -rightStickY else rightStickY
+                val leftInput = (if (tankSettings.invertThrottle) -leftStickY else leftStickY) * leftScale
+                val rightInput = (if (tankSettings.invertThrottle) -rightStickY else rightStickY) * rightScale
 
-                val leftPwm = (leftInput * speedLimit * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
-                val rightPwm = (rightInput * speedLimit * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
+                var leftVal = leftInput * speedLimit
+                var rightVal = rightInput * speedLimit
+
+                if (minPwm > 0) {
+                    if (abs(leftVal) > 0.01f) {
+                        val sign = if (leftVal > 0) 1f else -1f
+                        leftVal = sign * ((minPwm / 255.0f) + abs(leftVal) * ((255 - minPwm) / 255.0f))
+                    }
+                    if (abs(rightVal) > 0.01f) {
+                        val sign = if (rightVal > 0) 1f else -1f
+                        rightVal = sign * ((minPwm / 255.0f) + abs(rightVal) * ((255 - minPwm) / 255.0f))
+                    }
+                }
+
+                val leftPwm = (leftVal * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
+                val rightPwm = (rightVal * 255.0f).roundToInt().coerceIn(-255, 255).toShort()
                 Pair(leftPwm, rightPwm)
             }
         }

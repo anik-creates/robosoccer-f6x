@@ -44,6 +44,10 @@ class F6xPreferencesRepository(private val context: Context) {
         val INVERT_THROTTLE = booleanPreferencesKey("invert_throttle")
         val LEFT_STICK_SNAP_CENTER = booleanPreferencesKey("left_stick_snap_center")
         val GITHUB_REPO = stringPreferencesKey("github_repo")
+        val LEFT_MOTOR_TRIM = intPreferencesKey("tank_left_motor_trim")
+        val RIGHT_MOTOR_TRIM = intPreferencesKey("tank_right_motor_trim")
+        val STEERING_TRIM_OFFSET = intPreferencesKey("tank_steering_trim_offset")
+        val MIN_MOTOR_PWM = intPreferencesKey("tank_min_motor_pwm")
     }
 
     // Default 10 Channels setup
@@ -246,7 +250,11 @@ class F6xPreferencesRepository(private val context: Context) {
                 invertSteering = prefs[Keys.INVERT_STEERING] ?: false,
                 invertThrottle = prefs[Keys.INVERT_THROTTLE] ?: false,
                 leftStickSnapCenter = prefs[Keys.LEFT_STICK_SNAP_CENTER] ?: true,
-                githubRepo = prefs[Keys.GITHUB_REPO] ?: "anik-creates/robosoccer-f6x"
+                githubRepo = prefs[Keys.GITHUB_REPO] ?: "anik-creates/robosoccer-f6x",
+                leftMotorTrimPercent = prefs[Keys.LEFT_MOTOR_TRIM] ?: 100,
+                rightMotorTrimPercent = prefs[Keys.RIGHT_MOTOR_TRIM] ?: 100,
+                steeringTrimOffset = prefs[Keys.STEERING_TRIM_OFFSET] ?: 0,
+                minMotorPwm = prefs[Keys.MIN_MOTOR_PWM] ?: 0
             )
         }
 
@@ -262,6 +270,10 @@ class F6xPreferencesRepository(private val context: Context) {
             prefs[Keys.INVERT_THROTTLE] = settings.invertThrottle
             prefs[Keys.LEFT_STICK_SNAP_CENTER] = settings.leftStickSnapCenter
             prefs[Keys.GITHUB_REPO] = settings.githubRepo
+            prefs[Keys.LEFT_MOTOR_TRIM] = settings.leftMotorTrimPercent
+            prefs[Keys.RIGHT_MOTOR_TRIM] = settings.rightMotorTrimPercent
+            prefs[Keys.STEERING_TRIM_OFFSET] = settings.steeringTrimOffset
+            prefs[Keys.MIN_MOTOR_PWM] = settings.minMotorPwm
         }
     }
 }
