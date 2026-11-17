@@ -4,7 +4,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -29,6 +30,78 @@ import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
+/**
+ * Computes control-assist output with strict deadzone and non-restricting axis snapping.
+ * - Radial and per-axis deadzone ensures exact 0.0f output within deadzone.
+ * - Axis snapping assists straight driving and spot turns without trapping the user:
+ *   finger is freely tracked, and exiting the axis is instant and smooth.
+ */
+fun calculateControlAssist(
+    rawX: Float,
+    rawY: Float,
+    deadzone: Float,
+    snapToAxes: Boolean,
+    snapThreshold: Float
+): Pair<Float, Float> {
+    val dz = deadzone.coerceIn(0.0f, 0.40f)
+    val snapThresh = snapThreshold.coerceIn(0.02f, 0.40f)
+
+    // 1. Center radial deadzone check: inside circle -> strictly 0
+    val dist = hypot(rawX, rawY)
+    if (dist <= dz) {
+        return Pair(0f, 0f)
+    }
+
+    var px = rawX
+    var py = rawY
+
+    // 2. Independent axis deadzone:
+    // If lateral steering drift is within deadzone, steer is strictly 0 (rock-solid straight driving!)
+    if (abs(px) <= dz) {
+        px = 0f
+    }
+    // If longitudinal throttle drift is within deadzone, throttle is strictly 0 (rock-solid spot turns!)
+    if (abs(py) <= dz) {
+        py = 0f
+    }
+
+    if (px == 0f && py == 0f) {
+        return Pair(0f, 0f)
+    }
+
+    // 3. Control assist (snapping without restriction):
+    // Assist without trapping:
+    // When driving forward/reverse (|rawY| >= snapThresh) and lateral deflection |rawX| < snapThresh:
+    // snap steering to 0 for a laser-straight line.
+    // When doing a spot turn (|rawX| >= snapThresh) and longitudinal deflection |rawY| < snapThresh:
+    // snap throttle to 0 for a pure spot turn.
+    if (snapToAxes) {
+        if (abs(rawX) < snapThresh && abs(rawY) >= snapThresh) {
+            px = 0f
+        }
+        if (abs(rawY) < snapThresh && abs(rawX) >= snapThresh) {
+            py = 0f
+        }
+    }
+
+    // 4. Smooth linear scaling so there is no sudden jump when exiting deadzone or snap zone
+    val outX = if (px == 0f) 0f else {
+        val sign = if (px > 0f) 1f else -1f
+        val thresh = if (snapToAxes && abs(rawX) < snapThresh) snapThresh else dz
+        val mag = if (thresh < 1f) ((abs(px) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
+        sign * mag
+    }
+
+    val outY = if (py == 0f) 0f else {
+        val sign = if (py > 0f) 1f else -1f
+        val thresh = if (snapToAxes && abs(rawY) < snapThresh) snapThresh else dz
+        val mag = if (thresh < 1f) ((abs(py) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
+        sign * mag
+    }
+
+    return Pair(outX.coerceIn(-1f, 1f), outY.coerceIn(-1f, 1f))
+}
+
 @Composable
 fun VirtualJoystick(
     modifier: Modifier = Modifier,
@@ -52,6 +125,7 @@ fun VirtualJoystick(
 ) {
     val effectiveSize = (baseSizeDp * scale).dp
     var thumbOffset by remember { mutableStateOf(Offset.Zero) }
+    var isTouching by remember { mutableStateOf(false) }
 
     Box(
         modifier = modifier
@@ -78,87 +152,56 @@ fun VirtualJoystick(
 
                     val radius = size.width / 2.0f
                     val maxTravel = radius * 0.75f
+                    val center = Offset(size.width / 2f, size.height / 2f)
 
-                    fun calculateSnapped(dx: Float, dy: Float): Pair<Float, Float> {
-                        val rawX = (dx / maxTravel).coerceIn(-1f, 1f)
-                        val rawY = (-dy / maxTravel).coerceIn(-1f, 1f)
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        down.consume()
+                        isTouching = true
 
-                        var normX = rawX
-                        var normY = rawY
-
-                        // 1. Center deadzone
-                        if (hypot(rawX, rawY) < deadzone) {
-                            return Pair(0f, 0f)
-                        }
-
-                        // 2. Axis snapping
-                        if (snapToAxes) {
-                            // Snap to vertical axis (straight forward/reverse)
-                            if (abs(rawX) < snapThreshold && abs(rawY) >= deadzone) {
-                                normX = 0f
-                            }
-                            // Snap to horizontal axis (spot turn / spin)
-                            if (abs(rawY) < snapThreshold && abs(rawX) >= deadzone) {
-                                normY = 0f
-                            }
-                        }
-
-                        return Pair(normX, normY)
-                    }
-
-                    detectDragGestures(
-                        onDragStart = { offset ->
-                            val center = Offset(size.width / 2f, size.height / 2f)
-                            val delta = offset - center
+                        fun handlePointer(pos: Offset) {
+                            val delta = pos - center
                             val dist = delta.getDistance()
                             val clampedDist = dist.coerceAtMost(maxTravel)
                             val angle = atan2(delta.y, delta.x)
 
-                            val tx = clampedDist * cos(angle)
-                            val ty = clampedDist * sin(angle)
+                            val rawX = if (maxTravel > 0f) ((clampedDist * cos(angle)) / maxTravel).coerceIn(-1f, 1f) else 0f
+                            val rawY = if (maxTravel > 0f) ((-clampedDist * sin(angle)) / maxTravel).coerceIn(-1f, 1f) else 0f
 
-                            val (normX, normY) = calculateSnapped(tx, ty)
-                            thumbOffset = Offset(normX * maxTravel, -normY * maxTravel)
-                            onValueChange(normX, normY)
-                        },
-                        onDrag = { change, dragAmount ->
-                            change.consume()
-                            val newPos = thumbOffset + dragAmount
-                            val dist = newPos.getDistance()
-                            val clampedDist = dist.coerceAtMost(maxTravel)
-                            val angle = atan2(newPos.y, newPos.x)
-
-                            val tx = clampedDist * cos(angle)
-                            val ty = clampedDist * sin(angle)
-
-                            val (normX, normY) = calculateSnapped(tx, ty)
-                            thumbOffset = Offset(normX * maxTravel, -normY * maxTravel)
-                            onValueChange(normX, normY)
-                        },
-                        onDragEnd = {
-                            val newX = if (autoCenterX) 0f else (thumbOffset.x / maxTravel).coerceIn(-1f, 1f)
-                            val newY = if (autoCenterY) 0f else (-thumbOffset.y / maxTravel).coerceIn(-1f, 1f)
-
-                            val tx = if (autoCenterX) 0f else thumbOffset.x
-                            val ty = if (autoCenterY) 0f else thumbOffset.y
-                            thumbOffset = Offset(tx, ty)
-
-                            onValueChange(newX, newY)
-                        },
-                        onDragCancel = {
-                            if (autoCenterX && autoCenterY) {
-                                thumbOffset = Offset.Zero
-                                onValueChange(0f, 0f)
-                            }
+                            val (outX, outY) = calculateControlAssist(rawX, rawY, deadzone, snapToAxes, snapThreshold)
+                            thumbOffset = Offset(outX * maxTravel, -outY * maxTravel)
+                            onValueChange(outX, outY)
                         }
-                    )
+
+                        handlePointer(down.position)
+
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) {
+                                break
+                            }
+                            change.consume()
+                            handlePointer(change.position)
+                        }
+
+                        // Touch ended: release / snap back to center
+                        isTouching = false
+                        val finalX = if (autoCenterX) 0f else (thumbOffset.x / maxTravel).coerceIn(-1f, 1f)
+                        val finalY = if (autoCenterY) 0f else (-thumbOffset.y / maxTravel).coerceIn(-1f, 1f)
+                        thumbOffset = Offset(
+                            if (autoCenterX) 0f else thumbOffset.x,
+                            if (autoCenterY) 0f else thumbOffset.y
+                        )
+                        onValueChange(finalX, finalY)
+                    }
                 }
         ) {
             val center = Offset(size.width / 2f, size.height / 2f)
             val radius = size.width / 2f
             val maxTravel = radius * 0.75f
 
-            val currentThumbOffset = if (thumbOffset == Offset.Zero && (xValue != 0f || yValue != 0f)) {
+            val currentThumbOffset = if (!isTouching && (xValue != 0f || yValue != 0f)) {
                 Offset(xValue * maxTravel, -yValue * maxTravel)
             } else {
                 thumbOffset
@@ -198,10 +241,11 @@ fun VirtualJoystick(
                 strokeWidth = 1.5.dp.toPx()
             )
 
-            // 4. Center deadband ring
+            // 4. Center deadzone boundary ring (clearly visualizes the 0-output deadband)
+            val deadbandRadius = (maxTravel * deadzone).coerceAtLeast(4.dp.toPx())
             drawCircle(
                 color = Color(0x44FFFFFF),
-                radius = maxTravel * 0.08f,
+                radius = deadbandRadius,
                 center = center,
                 style = Stroke(width = 1.dp.toPx())
             )

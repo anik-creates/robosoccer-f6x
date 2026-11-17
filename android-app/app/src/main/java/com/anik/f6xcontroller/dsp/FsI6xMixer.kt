@@ -26,36 +26,70 @@ object FsI6xMixer {
 
     /**
      * Applies Cardinal Axis Snapping & Deadzone filter:
-     * - Deadzone (default 15%): if radius < deadzone, snaps to (0, 0).
-     * - Axis Snapping (default 15%):
-     *     * If |x| < snapThreshold and |y| >= deadzone: X snaps to 0.0f (laser straight forward/reverse driving!)
-     *     * If |y| < snapThreshold and |x| >= deadzone: Y snaps to 0.0f (pure stationary spot turn / spin!)
+     * - Strict Deadzone: both radial (hypot <= dz) and per-axis (|x| <= dz, |y| <= dz)
+     *   ensuring the stick outputs EXACTLY 0.0f within the deadzone with zero drift or motor creep.
+     * - Control-Assist Axis Snapping:
+     *   * If driving forward/reverse (|y| >= snapThreshold) and lateral drift |x| < snapThreshold: X snaps to 0.0f
+     *   * If doing a spot turn (|x| >= snapThreshold) and longitudinal drift |y| < snapThreshold: Y snaps to 0.0f
+     *   * Freedom of movement: user is never restricted or stuck when switching axes.
      */
     fun applySnappingAndDeadzone(
         x: Float,
         y: Float,
         settings: TankControlSettings
     ): Pair<Float, Float> {
+        val dz = settings.deadzone.coerceIn(0.0f, 0.40f)
+        val snapThresh = settings.snapThreshold.coerceIn(0.02f, 0.40f)
+
+        // 1. Center radial deadzone check: inside circle -> strictly (0, 0)
         val dist = hypot(x, y)
-        if (dist < settings.deadzone) {
+        if (dist <= dz) {
             return Pair(0f, 0f)
         }
 
         var px = x
         var py = y
 
+        // 2. Per-axis deadzone:
+        // If steering is within deadzone -> 0 (laser-straight forward/reverse)
+        if (abs(px) <= dz) {
+            px = 0f
+        }
+        // If throttle is within deadzone -> 0 (pure spot turn)
+        if (abs(py) <= dz) {
+            py = 0f
+        }
+
+        if (px == 0f && py == 0f) {
+            return Pair(0f, 0f)
+        }
+
+        // 3. Control assist (snapping without restriction):
         if (settings.snapToAxes) {
-            // Forward/Reverse straight assist: Snap X to 0 when near vertical axis
-            if (abs(px) < settings.snapThreshold && abs(py) >= settings.deadzone) {
+            if (abs(x) < snapThresh && abs(y) >= snapThresh) {
                 px = 0f
             }
-            // Spot Turn assist: Snap Y to 0 when near horizontal axis
-            if (abs(py) < settings.snapThreshold && abs(px) >= settings.deadzone) {
+            if (abs(y) < snapThresh && abs(x) >= snapThresh) {
                 py = 0f
             }
         }
 
-        return Pair(px.coerceIn(-1f, 1f), py.coerceIn(-1f, 1f))
+        // 4. Smooth linear scaling so there is no step jump
+        val outX = if (px == 0f) 0f else {
+            val sign = if (px > 0f) 1f else -1f
+            val thresh = if (settings.snapToAxes && abs(x) < snapThresh) snapThresh else dz
+            val mag = if (thresh < 1f) ((abs(px) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
+            sign * mag
+        }
+
+        val outY = if (py == 0f) 0f else {
+            val sign = if (py > 0f) 1f else -1f
+            val thresh = if (settings.snapToAxes && abs(y) < snapThresh) snapThresh else dz
+            val mag = if (thresh < 1f) ((abs(py) - thresh) / (1f - thresh)).coerceIn(0f, 1f) else 1f
+            sign * mag
+        }
+
+        return Pair(outX.coerceIn(-1f, 1f), outY.coerceIn(-1f, 1f))
     }
 
     /**
@@ -74,9 +108,10 @@ object FsI6xMixer {
             tankSettings
         )
 
-        // Left stick uses snap to center or deadzone
-        val leftX = if (abs(sticks.leftX) < tankSettings.deadzone) 0f else sticks.leftX
-        val leftY = if (abs(sticks.leftY) < tankSettings.deadzone) 0f else sticks.leftY
+        // Left stick uses deadzone
+        val leftDz = tankSettings.deadzone.coerceIn(0.0f, 0.40f)
+        val leftX = if (abs(sticks.leftX) <= leftDz) 0f else sticks.leftX
+        val leftY = if (abs(sticks.leftY) <= leftDz) 0f else sticks.leftY
 
         return ProcessedChannels(
             ch1Aileron = rightX,  // CH1: Right Stick X (Steering)
@@ -95,7 +130,7 @@ object FsI6xMixer {
 
         // 1. Deadband filter
         val db = config.deadband.coerceIn(0.0f, 0.4f)
-        if (abs(x) < db) {
+        if (abs(x) <= db) {
             x = 0.0f
         } else {
             val sign = if (x > 0f) 1.0f else -1.0f
@@ -108,8 +143,10 @@ object FsI6xMixer {
         }
 
         // 3. Subtrim (-120 to +120 -> scaled to ±0.25 max offset)
-        val subtrimOffset = (config.subtrim / 120.0f) * 0.25f
-        x = (x + subtrimOffset).coerceIn(-1.0f, 1.0f)
+        if (config.subtrim != 0) {
+            val subtrimOffset = (config.subtrim / 120.0f) * 0.25f
+            x = (x + subtrimOffset).coerceIn(-1.0f, 1.0f)
+        }
 
         // 4. Dual Rate (0..100%) and Exponential Curve (-100%..+100%)
         // Formula: y = DR * ((1 - expo) * x + expo * x^3)
@@ -153,6 +190,11 @@ object FsI6xMixer {
         rightStickY: Float,
         tankSettings: TankControlSettings = TankControlSettings()
     ): Pair<Short, Short> {
+        // Guaranteed zero output when stick is at center / resting in deadzone
+        if (throttle == 0f && steering == 0f && mixingMode == MixingMode.ARCADE) {
+            return Pair(0.toShort(), 0.toShort())
+        }
+
         val speedLimit = (tankSettings.maxSpeedPercent / 100.0f).coerceIn(0.1f, 1.0f)
         val steerSens = (tankSettings.steeringSensitivity / 100.0f).coerceIn(0.2f, 1.0f)
 

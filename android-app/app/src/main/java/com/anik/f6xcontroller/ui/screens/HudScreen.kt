@@ -496,8 +496,8 @@ private fun ApexTopNavbar(
                 }
             }
 
-            // Center: Live Left & Right Motor Speed Graph (Forward & Reverse) - Locked 32.dp height
-            TankMotorSpeedGraph(
+            // Center: Plain White Motor Speed Bars (Strictly Locked Height & Width, No Pill)
+            LockedTankMotorSpeedBars(
                 leftPwm = telemetry.leftPwm.toInt(),
                 rightPwm = telemetry.rightPwm.toInt(),
                 lastRttMs = telemetry.lastRttMs
@@ -579,121 +579,140 @@ private fun ApexTopNavbar(
 }
 
 /**
- * Live Bipolar Motor Speed Graph for 4WD Tank Drive (Forward & Reverse)
+ * Plain White Locked Motor Speed Bars (No Pill, Strictly Fixed Width & Height)
+ * - Zero shifting: locked container (186.dp width x 28.dp height)
+ * - Plain white rectangular outline and solid fill (no pill container)
+ * - Values 0..255 never change the width, layout, or alignment
  */
 @Composable
-private fun TankMotorSpeedGraph(
+private fun LockedTankMotorSpeedBars(
     leftPwm: Int,
     rightPwm: Int,
-    lastRttMs: Float
+    lastRttMs: Float,
+    modifier: Modifier = Modifier
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.height(32.dp)
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = modifier
+            .width(186.dp)
+            .height(28.dp)
     ) {
-        // Left Track Dynamic Meter
-        SingleTrackSpeedMeter(label = "L", pwm = leftPwm)
+        // Left Track Plain White Bar (Strictly locked 74.dp width, 24.dp height)
+        PlainWhiteTrackBar(label = "L", pwm = leftPwm, modifier = Modifier.width(74.dp).height(24.dp))
 
-        // Right Track Dynamic Meter
-        SingleTrackSpeedMeter(label = "R", pwm = rightPwm)
+        // Right Track Plain White Bar (Strictly locked 74.dp width, 24.dp height)
+        PlainWhiteTrackBar(label = "R", pwm = rightPwm, modifier = Modifier.width(74.dp).height(24.dp))
 
-        // RTT Latency
-        Text(
-            text = "${"%.1f".format(lastRttMs)}ms",
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 10.sp,
-            color = PureWhite,
-            maxLines = 1,
-            softWrap = false
-        )
+        // RTT Latency Readout (Strictly locked 26.dp width)
+        Box(
+            modifier = Modifier.width(26.dp),
+            contentAlignment = Alignment.CenterEnd
+        ) {
+            val rttText = "${lastRttMs.roundToInt()}ms"
+            Text(
+                text = rttText,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 8.sp,
+                color = PureWhite,
+                maxLines = 1,
+                softWrap = false
+            )
+        }
     }
 }
 
 @Composable
-private fun SingleTrackSpeedMeter(
+private fun PlainWhiteTrackBar(
     label: String,
-    pwm: Int
+    pwm: Int,
+    modifier: Modifier = Modifier
 ) {
     val norm = (pwm / 255.0f).coerceIn(-1.0f, 1.0f)
     val pct = (abs(norm) * 100).roundToInt()
+    val dir = if (pwm > 0) "F" else if (pwm < 0) "R" else " "
+    val speedText = "$dir$pct%".padStart(4, ' ')
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        modifier = Modifier
-            .height(26.dp)
-            .clip(RoundedCornerShape(6.dp))
-            .background(PillSurface)
-            .border(1.dp, PillBorderMuted, RoundedCornerShape(6.dp))
-            .padding(horizontal = 5.dp)
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        modifier = modifier
     ) {
-        Text(
-            text = label,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 9.sp,
-            color = TextSecondary,
-            maxLines = 1,
-            softWrap = false
-        )
+        // Fixed-width track label (e.g. "L" or "R")
+        Box(
+            modifier = Modifier.width(10.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Text(
+                text = label,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 9.sp,
+                color = PureWhite,
+                maxLines = 1,
+                softWrap = false
+            )
+        }
 
-        // Bipolar Bar Graphic (Center 0, Left = REV, Right = FWD)
-        Canvas(modifier = Modifier.size(width = 46.dp, height = 10.dp)) {
+        // Plain White Rectangular Bar (Strictly locked 36.dp width x 12.dp height, NO PILL)
+        Canvas(modifier = Modifier.size(width = 36.dp, height = 12.dp)) {
             val w = size.width
             val h = size.height
             val midX = w / 2f
 
-            // Background slot
-            drawRoundRect(
-                color = Color(0xFF1E1E1E),
+            // 1. Crisp White Rectangular Outer Border (1.dp solid, NO rounded pill)
+            drawRect(
+                color = PureWhite,
                 topLeft = Offset(0f, 0f),
                 size = Size(w, h),
-                cornerRadius = CornerRadius(2.dp.toPx())
+                style = Stroke(width = 1.dp.toPx())
             )
 
-            // Center baseline
+            // 2. Center Zero Baseline Tick
             drawLine(
-                color = PillBorderMuted,
+                color = PureWhite,
                 start = Offset(midX, 0f),
                 end = Offset(midX, h),
                 strokeWidth = 1.dp.toPx()
             )
 
-            // Active bar
-            if (norm > 0) {
-                // Forward (Right fill)
-                val barW = (midX * norm)
-                drawRoundRect(
+            // 3. Plain White Solid Fill (Left = REV, Right = FWD)
+            val maxFillW = (midX - 2.dp.toPx()).coerceAtLeast(0f)
+            if (norm > 0f) {
+                // Forward (Fill rightwards)
+                val fillW = maxFillW * norm
+                drawRect(
                     color = PureWhite,
-                    topLeft = Offset(midX, 1.5f),
-                    size = Size(barW, h - 3f),
-                    cornerRadius = CornerRadius(1.dp.toPx())
+                    topLeft = Offset(midX + 1.dp.toPx(), 2.dp.toPx()),
+                    size = Size(fillW, h - 4.dp.toPx())
                 )
-            } else if (norm < 0) {
-                // Reverse (Left fill)
-                val barW = (midX * abs(norm))
-                drawRoundRect(
-                    color = Color(0xFFAAAAAA),
-                    topLeft = Offset(midX - barW, 1.5f),
-                    size = Size(barW, h - 3f),
-                    cornerRadius = CornerRadius(1.dp.toPx())
+            } else if (norm < 0f) {
+                // Reverse (Fill leftwards)
+                val fillW = maxFillW * abs(norm)
+                drawRect(
+                    color = PureWhite,
+                    topLeft = Offset(midX - 1.dp.toPx() - fillW, 2.dp.toPx()),
+                    size = Size(fillW, h - 4.dp.toPx())
                 )
             }
         }
 
-        // Percentage & Direction
-        val dir = if (pwm > 0) "F" else if (pwm < 0) "R" else "0"
-        Text(
-            text = "$dir$pct%",
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 8.sp,
-            color = PureWhite,
-            maxLines = 1,
-            softWrap = false
-        )
+        // Fixed-width percentage readout (Strictly locked 24.dp width)
+        Box(
+            modifier = Modifier.width(24.dp),
+            contentAlignment = Alignment.CenterEnd
+        ) {
+            Text(
+                text = speedText,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 8.sp,
+                color = PureWhite,
+                maxLines = 1,
+                softWrap = false
+            )
+        }
     }
 }
 
