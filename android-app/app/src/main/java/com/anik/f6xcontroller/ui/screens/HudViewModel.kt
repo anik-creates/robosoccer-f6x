@@ -23,6 +23,9 @@ import kotlinx.coroutines.launch
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.Inet4Address
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -92,8 +95,38 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     @Volatile
     private var boundDatagramSocket: DatagramSocket? = null
     @Volatile
+    private var subnetDatagramSocket: DatagramSocket? = null
+    @Volatile
     private var fallbackDatagramSocket: DatagramSocket? = null
     private var javaTxSeq: Short = 0
+
+    private fun getSubnetDatagramSocket(): DatagramSocket? {
+        try {
+            if (subnetDatagramSocket != null && !subnetDatagramSocket!!.isClosed) {
+                return subnetDatagramSocket
+            }
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (iface in interfaces) {
+                for (addr in iface.inetAddresses) {
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        val host = addr.hostAddress ?: ""
+                        if (host.startsWith("192.168.4.")) {
+                            Log.i("HudViewModel", "Found robot AP subnet IP: $host. Binding socket directly to wlan0...")
+                            val s = DatagramSocket(InetSocketAddress(addr, 0)).apply {
+                                broadcast = true
+                                soTimeout = 10
+                            }
+                            subnetDatagramSocket = s
+                            return s
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("HudViewModel", "Subnet socket error: ${e.message}")
+        }
+        return null
+    }
 
     init {
         // Fallback unbound socket with broadcast enabled for zero-delay transmission
@@ -104,6 +137,14 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             }
         } catch (e: Exception) {
             Log.e("HudViewModel", "Failed to create fallback socket: ${e.message}")
+        }
+
+        // Continuous Wi-Fi watchdog: runs every 200 ms to auto-lock process to robot Wi-Fi as soon as connected
+        viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                wifiLockManager.checkExistingWifiConnection()
+                delay(200)
+            }
         }
 
         // 1. Initialize native C++ UDP Engine
@@ -223,7 +264,6 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun sendViaJavaSocket(ip: String, port: Int, left: Short, right: Short, aux: Int) {
-        val socket = boundDatagramSocket ?: fallbackDatagramSocket ?: return
         try {
             javaTxSeq = (javaTxSeq + 1).toShort()
             val buf = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
@@ -248,18 +288,40 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             }
             buf.putShort(crc.toShort())
 
-            val targetAddr = InetAddress.getByName(ip)
+            val targetIp = if (ip.isBlank()) "192.168.4.1" else ip
+            val targetAddr = InetAddress.getByName(targetIp)
             val packet = DatagramPacket(bytes, 12, targetAddr, port)
-            socket.send(packet)
+            val bcastAddr = InetAddress.getByName("192.168.4.255")
+            val bcastPacket = DatagramPacket(bytes, 12, bcastAddr, port)
 
-            // Also send broadcast to 192.168.4.255 for zero-delay AP discovery
-            try {
-                val bcastAddr = InetAddress.getByName("192.168.4.255")
-                val bcastPacket = DatagramPacket(bytes, 12, bcastAddr, port)
-                socket.send(bcastPacket)
-            } catch (_: Exception) {}
+            // A. Send via subnet socket bound directly to 192.168.4.x (bypasses any mobile data)
+            getSubnetDatagramSocket()?.let { s ->
+                try {
+                    s.send(packet)
+                    s.send(bcastPacket)
+                } catch (e: Exception) {
+                    Log.w("HudViewModel", "Subnet socket send error: ${e.message}")
+                }
+            }
+
+            // B. Send via Android Network-bound socket
+            boundDatagramSocket?.let { s ->
+                try {
+                    s.send(packet)
+                    s.send(bcastPacket)
+                } catch (e: Exception) {
+                    Log.w("HudViewModel", "Bound socket send error: ${e.message}")
+                }
+            }
+
+            // C. Send via fallback socket
+            fallbackDatagramSocket?.let { s ->
+                try {
+                    s.send(packet)
+                } catch (_: Exception) {}
+            }
         } catch (e: Exception) {
-            // Silently ignore drop; 100 Hz rate recovers on next frame
+            Log.e("HudViewModel", "sendViaJavaSocket error: ${e.message}")
         }
     }
 

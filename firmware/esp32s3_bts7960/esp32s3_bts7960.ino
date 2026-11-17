@@ -80,48 +80,18 @@ WiFiUDP g_udp;
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // -------------------------------------------------------------------------------------
-// Universal Multi-Pin NeoPixel (WS2812) Visual Debugger Driver
-// Drives GPIO 48 and GPIO 38 at register level (Works on DevKitC-1, YD-ESP32-S3, NodeMCU S3)
+// Universal Multi-Pin NeoPixel (WS2812) Visual Debugger Driver (GPIO 48)
+// Hardware RMT driver via Arduino Core neopixelWrite(48, r, g, b)
 // Keeps GPIO 21 (discrete blue LED) turned OFF.
 // -------------------------------------------------------------------------------------
 void init_status_led() {
-    pinMode(48, OUTPUT);
-    pinMode(38, OUTPUT);
-    digitalWrite(48, LOW);
-    digitalWrite(38, LOW);
     pinMode(21, OUTPUT);
     digitalWrite(21, LOW); // Separate blue onboard LED kept OFF
+    neopixelWrite(48, 0, 0, 0); // Start OFF
 }
 
 void set_status_led(uint8_t r, uint8_t g, uint8_t b) {
-    // Upper pins in GPIO.out1: GPIO 48 (bit 16) and GPIO 38 (bit 6)
-    const uint32_t mask1 = (1UL << (48 - 32)) | (1UL << (38 - 32));
-
-    // Color order: GRB (24-bit)
-    uint32_t color = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
-
-    portDISABLE_INTERRUPTS();
-
-    for (int i = 23; i >= 0; i--) {
-        uint32_t bit = (color >> i) & 1;
-        // 240 MHz CPU: 1 cycle = 4.167 ns
-        // Bit 1: 800 ns High (~192 cycles), 450 ns Low (~108 cycles)
-        // Bit 0: 350 ns High (~84 cycles), 900 ns Low (~216 cycles)
-        uint32_t t_high = bit ? 192 : 84;
-        uint32_t t_period = 300; // 1.25 us
-
-        uint32_t start = xthal_get_ccount();
-        GPIO.out1_w1ts.val = mask1;
-
-        while ((xthal_get_ccount() - start) < t_high) {}
-
-        GPIO.out1_w1tc.val = mask1;
-
-        while ((xthal_get_ccount() - start) < t_period) {}
-    }
-
-    portENABLE_INTERRUPTS();
-    delayMicroseconds(80); // Latch
+    neopixelWrite(48, r, g, b);
 }
 
 /**
@@ -314,46 +284,43 @@ void process_udp_packets() {
 
     // Drain all queued packets up to latest
     while (int packet_size = g_udp.parsePacket()) {
-        if (packet_size >= (int)sizeof(ControlPacket)) {
-            int bytes_read = g_udp.read(rx_buffer, sizeof(ControlPacket));
-            if (bytes_read == sizeof(ControlPacket)) {
-                ControlPacket *pkt = reinterpret_cast<ControlPacket*>(rx_buffer);
+        int bytes_read = g_udp.read(rx_buffer, sizeof(rx_buffer));
+        if (bytes_read >= (int)sizeof(ControlPacket)) {
+            ControlPacket *pkt = reinterpret_cast<ControlPacket*>(rx_buffer);
 
-                // 1. Verify 0xAA55 Magic Word
-                if (pkt->magic == 0xAA55) {
-                    // 2. Compute & Verify CRC-16 over first 10 bytes
-                    uint16_t computed_crc = calculate_crc16(rx_buffer, 10);
-                    if (computed_crc == pkt->crc16) {
-                        portENTER_CRITICAL(&g_mux);
-                        g_target_left_pwm   = pkt->left_pwm;
-                        g_target_right_pwm  = pkt->right_pwm;
-                        g_target_aux_packed = pkt->aux_packed;
-                        g_last_packet_time  = millis();
-                        g_rx_packet_count++;
-                        g_failsafe_active   = false;
-                        g_client_connected  = true;
-                        portEXIT_CRITICAL(&g_mux);
+            // 1. Verify 0xAA55 Magic Word
+            if (pkt->magic == 0xAA55) {
+                // 2. Compute & Verify CRC-16 over first 10 bytes
+                uint16_t computed_crc = calculate_crc16(rx_buffer, 10);
+                if (computed_crc == pkt->crc16) {
+                    portENTER_CRITICAL(&g_mux);
+                    g_target_left_pwm   = pkt->left_pwm;
+                    g_target_right_pwm  = pkt->right_pwm;
+                    g_target_aux_packed = pkt->aux_packed;
+                    g_last_packet_time  = millis();
+                    g_rx_packet_count++;
+                    g_failsafe_active   = false;
+                    g_client_connected  = true;
+                    portEXIT_CRITICAL(&g_mux);
 
-                        if (s_first_packet) {
-                            s_first_packet = false;
-                            Serial.printf("[UDP] FIRST VALID PACKET RECEIVED! Magic: 0x%04X, Seq: %u, Left: %d, Right: %d\n",
-                                pkt->magic, pkt->seq, pkt->left_pwm, pkt->right_pwm);
-                        }
-
-                        // 3. Heartbeat ACK every 20 packets for phone RTT calculation
-                        if ((pkt->seq % 20) == 0) {
-                            ack_packet.ack_seq = pkt->seq;
-                            g_udp.beginPacket(g_udp.remoteIP(), g_udp.remotePort());
-                            g_udp.write(reinterpret_cast<const uint8_t*>(&ack_packet), sizeof(AckPacket));
-                            g_udp.endPacket();
-                        }
-                    } else {
-                        g_crc_error_count++;
+                    if (s_first_packet) {
+                        s_first_packet = false;
+                        Serial.printf("\n[UDP] >>> FIRST VALID TELEMETRY PACKET RECEIVED FROM PHONE! <<<\n");
+                        Serial.printf("[UDP] Magic: 0x%04X | Seq: %u | Left: %d | Right: %d\n\n",
+                            pkt->magic, pkt->seq, pkt->left_pwm, pkt->right_pwm);
                     }
+
+                    // 3. Heartbeat ACK every 20 packets for phone RTT calculation
+                    if ((pkt->seq % 20) == 0) {
+                        ack_packet.ack_seq = pkt->seq;
+                        g_udp.beginPacket(g_udp.remoteIP(), g_udp.remotePort());
+                        g_udp.write(reinterpret_cast<const uint8_t*>(&ack_packet), sizeof(AckPacket));
+                        g_udp.endPacket();
+                    }
+                } else {
+                    g_crc_error_count++;
                 }
             }
-        } else {
-            g_udp.flush();
         }
     }
 }
@@ -370,11 +337,17 @@ void setup() {
     Serial.println("  Author: Anik Sarker                                  ");
     Serial.println("=======================================================");
 
-    // Initialize Universal Multi-Pin NeoPixel (WS2812)
+    // Initialize Universal Multi-Pin NeoPixel (WS2812 on GPIO 48)
     init_status_led();
 
-    // Brief Yellow flash during boot (200 ms)
-    set_status_led(180, 80, 0);
+    // 1-Second Visual Self-Test during boot (Green -> Red -> Purple -> Yellow -> OFF)
+    Serial.println("[LED] Running NeoPixel GPIO 48 Self-Test...");
+    neopixelWrite(48, 0, 180, 0); delay(200);   // Green (Forward test)
+    neopixelWrite(48, 180, 0, 0); delay(200);   // Red (Reverse test)
+    neopixelWrite(48, 180, 0, 180); delay(200); // Purple (Right test)
+    neopixelWrite(48, 180, 180, 0); delay(200); // Yellow (Left test)
+    neopixelWrite(48, 0, 0, 0);                 // OFF - ready for app!
+    Serial.println("[LED] NeoPixel Self-Test Complete. LED is OFF (waiting for throttle).");
 
     // 1. Initialize BTS7960 Motor Drivers
     init_motor_drivers();

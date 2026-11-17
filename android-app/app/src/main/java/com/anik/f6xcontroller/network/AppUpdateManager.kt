@@ -26,7 +26,7 @@ sealed class CheckUpdateResult {
 }
 
 object AppUpdateManager {
-    const val CURRENT_APP_VERSION = "1.0.0"
+    const val CURRENT_APP_VERSION = "1.0.6"
     const val DEFAULT_REPO = "anik-creates/robosoccer-f6x"
 
     suspend fun checkLatestRelease(repo: String = DEFAULT_REPO): CheckUpdateResult = withContext(Dispatchers.IO) {
@@ -36,13 +36,43 @@ object AppUpdateManager {
         var lastError = "Unable to connect to GitHub"
 
         for (candidate in candidates.distinct()) {
+            // 1. First attempt: Direct GitHub Web 302 Redirect (Bypasses API 403 rate limits completely!)
+            try {
+                val webUrl = "https://github.com/$candidate/releases/latest"
+                val webConn = URL(webUrl).openConnection() as HttpURLConnection
+                webConn.instanceFollowRedirects = false
+                webConn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 10; Mobile)")
+                webConn.connectTimeout = 6000
+                webConn.readTimeout = 6000
+                val redirect = webConn.getHeaderField("Location")
+                if (!redirect.isNullOrBlank() && redirect.contains("/releases/tag/")) {
+                    val tag = redirect.substringAfterLast("/").trim()
+                    val apkUrl = "https://github.com/$candidate/releases/download/$tag/APEX_F6X_Controller_$tag.apk"
+                    if (isNewerVersion(tag, CURRENT_APP_VERSION)) {
+                        return@withContext CheckUpdateResult.UpdateAvailable(
+                            UpdateInfo(
+                                tagName = tag,
+                                releaseName = "APEX-F6X $tag",
+                                releaseNotes = "Latest release from $candidate",
+                                apkDownloadUrl = apkUrl
+                            )
+                        )
+                    } else {
+                        return@withContext CheckUpdateResult.UpToDate(CURRENT_APP_VERSION)
+                    }
+                }
+            } catch (e: Exception) {
+                lastError = "Redirect check error: ${e.message}"
+            }
+
+            // 2. Second attempt: GitHub REST API fallback
             try {
                 val apiUrl = "https://api.github.com/repos/$candidate/releases/latest"
                 val url = URL(apiUrl)
                 val conn = url.openConnection() as HttpURLConnection
                 conn.requestMethod = "GET"
                 conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
-                conn.setRequestProperty("User-Agent", "APEX-Soccerbot-App")
+                conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 10; Mobile)")
                 conn.connectTimeout = 6000
                 conn.readTimeout = 6000
 
