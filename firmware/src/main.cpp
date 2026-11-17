@@ -80,24 +80,22 @@ WiFiUDP g_udp;
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // -------------------------------------------------------------------------------------
-// Universal Multi-Pin NeoPixel (WS2812) Status Driver
-// Simultaneously drives GPIO 48, GPIO 38, and GPIO 21 at register level
-// Works on DevKitC-1, YD-ESP32-S3, NodeMCU ESP32-S3, and generic clones.
+// Universal Multi-Pin NeoPixel (WS2812) Visual Debugger Driver
+// Drives GPIO 48 and GPIO 38 at register level (Works on DevKitC-1, YD-ESP32-S3, NodeMCU S3)
+// Keeps GPIO 21 (discrete blue LED) turned OFF.
 // -------------------------------------------------------------------------------------
 void init_status_led() {
     pinMode(48, OUTPUT);
     pinMode(38, OUTPUT);
-    pinMode(21, OUTPUT);
     digitalWrite(48, LOW);
     digitalWrite(38, LOW);
-    digitalWrite(21, LOW);
+    pinMode(21, OUTPUT);
+    digitalWrite(21, LOW); // Separate blue onboard LED kept OFF
 }
 
 void set_status_led(uint8_t r, uint8_t g, uint8_t b) {
     // Upper pins in GPIO.out1: GPIO 48 (bit 16) and GPIO 38 (bit 6)
     const uint32_t mask1 = (1UL << (48 - 32)) | (1UL << (38 - 32));
-    // Lower pin in GPIO.out: GPIO 21 (bit 21)
-    const uint32_t mask0 = (1UL << 21);
 
     // Color order: GRB (24-bit)
     uint32_t color = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
@@ -114,12 +112,10 @@ void set_status_led(uint8_t r, uint8_t g, uint8_t b) {
 
         uint32_t start = xthal_get_ccount();
         GPIO.out1_w1ts.val = mask1;
-        GPIO.out_w1ts      = mask0;
 
         while ((xthal_get_ccount() - start) < t_high) {}
 
         GPIO.out1_w1tc.val = mask1;
-        GPIO.out_w1tc      = mask0;
 
         while ((xthal_get_ccount() - start) < t_period) {}
     }
@@ -129,36 +125,69 @@ void set_status_led(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 /**
- * Status LED Indicator:
- * Blinks for 150 ms in the current status color every 5 seconds (5000 ms).
- * Stays completely OFF for the other 4850 ms of the cycle (no blinding solid light).
+ * Visual Debugger on NeoPixel RGB LED:
+ * - Throttle Zero / Idle / Failsafe : LED Turned OFF
+ * - Forward   : GREEN  (Brightness scales with throttle 0..255)
+ * - Reverse   : RED    (Brightness scales with throttle 0..255)
+ * - Turn Right: PURPLE (Brightness scales with steering 0..255)
+ * - Turn Left : YELLOW (Brightness scales with steering 0..255)
  */
-void update_status_led(uint32_t now, bool is_failsafe, bool client_connected) {
-    const uint32_t BLINK_PERIOD_MS   = 5000;
-    const uint32_t BLINK_DURATION_MS = 150;
+void update_motor_status_led(int16_t left_pwm, int16_t right_pwm, bool is_failsafe) {
+    static uint8_t s_last_r = 255, s_last_g = 255, s_last_b = 255;
 
-    static bool s_was_in_blink = false;
-    bool is_blink_window = (now % BLINK_PERIOD_MS) < BLINK_DURATION_MS;
+    // 1. Throttle is zero / stopped / idle / failsafe -> LED TURNED OFF
+    if (is_failsafe || (abs(left_pwm) < 8 && abs(right_pwm) < 8)) {
+        if (s_last_r != 0 || s_last_g != 0 || s_last_b != 0) {
+            s_last_r = 0; s_last_g = 0; s_last_b = 0;
+            set_status_led(0, 0, 0);
+        }
+        return;
+    }
 
-    if (is_blink_window) {
-        if (!s_was_in_blink) {
-            s_was_in_blink = true;
-            if (!is_failsafe && client_connected) {
-                // Emerald Green: Connected & Active 100 Hz Control
-                set_status_led(0, 255, 30);
-            } else if (!client_connected) {
-                // Sky Blue: AP Ready / Waiting for Phone (Link Released)
-                set_status_led(0, 50, 255);
-            } else {
-                // Crimson Red: Failsafe Triggered (> 150 ms packet timeout)
-                set_status_led(255, 0, 0);
-            }
+    // 2. Decompose Tank speeds into Forward/Reverse and Steering components
+    int32_t fwd_comp  = ((int32_t)left_pwm + (int32_t)right_pwm) / 2;
+    int32_t turn_comp = ((int32_t)left_pwm - (int32_t)right_pwm) / 2;
+
+    int32_t abs_fwd  = abs(fwd_comp);
+    int32_t abs_turn = abs(turn_comp);
+
+    uint8_t r = 0, g = 0, b = 0;
+
+    if (abs_fwd >= abs_turn) {
+        // Forward / Reverse motion dominates
+        uint8_t bri = (uint8_t)constrain(abs_fwd, 15, 255);
+        if (fwd_comp > 0) {
+            // FORWARD: GREEN (brightness according to throttle)
+            r = 0;
+            g = bri;
+            b = 0;
+        } else {
+            // REVERSE: RED (brightness according to throttle)
+            r = bri;
+            g = 0;
+            b = 0;
         }
     } else {
-        if (s_was_in_blink) {
-            s_was_in_blink = false;
-            set_status_led(0, 0, 0); // Turn completely OFF
+        // Steering / Turning motion dominates
+        uint8_t bri = (uint8_t)constrain(abs_turn, 15, 255);
+        if (turn_comp > 0) {
+            // RIGHT: PURPLE (Magenta: Red + Blue, brightness according to steer)
+            r = bri;
+            g = 0;
+            b = bri;
+        } else {
+            // LEFT: YELLOW (Red + Green, brightness according to steer)
+            r = bri;
+            g = bri;
+            b = 0;
         }
+    }
+
+    if (abs((int)r - (int)s_last_r) > 2 || abs((int)g - (int)s_last_g) > 2 || abs((int)b - (int)s_last_b) > 2) {
+        s_last_r = r;
+        s_last_g = g;
+        s_last_b = b;
+        set_status_led(r, g, b);
     }
 }
 
@@ -435,16 +464,48 @@ void loop() {
         apply_aux_channels(cur_aux);
     }
 
-    // 5. Short Blink in Indicator Color Every 5 Seconds (No Solid Light)
-    bool has_client = (WiFi.softAPgetStationNum() > 0) || g_client_connected;
-    update_status_led(now, is_failsafe, has_client);
+    // 5. Interactive NeoPixel LED Visual Debugger
+    // Throttle Zero -> OFF | Forward -> GREEN | Reverse -> RED | Right -> PURPLE | Left -> YELLOW
+    update_motor_status_led(cur_left, cur_right, is_failsafe);
 
-    // 6. Periodic Serial Diagnostics every 5 seconds
-    static uint32_t s_last_stat_time = 0;
-    if (now - s_last_stat_time >= 5000) {
-        s_last_stat_time = now;
-        Serial.printf("[STATS] Stations: %d | RX Pkts: %u | CRC Errs: %u | Failsafe: %d | PWM: L=%d R=%d\n",
-            WiFi.softAPgetStationNum(), g_rx_packet_count, g_crc_error_count, is_failsafe, cur_left, cur_right);
+    // 6. Live Motor Speed & Direction in Serial Monitor (every 100 ms = 10 Hz)
+    static uint32_t s_last_serial_print = 0;
+    if (now - s_last_serial_print >= 100) {
+        s_last_serial_print = now;
+
+        const char* motion = "STOPPED";
+        const char* led_color = "OFF";
+        int32_t fwd_comp  = ((int32_t)cur_left + (int32_t)cur_right) / 2;
+        int32_t turn_comp = ((int32_t)cur_left - (int32_t)cur_right) / 2;
+        int32_t abs_fwd   = abs(fwd_comp);
+        int32_t abs_turn  = abs(turn_comp);
+
+        if (is_failsafe) {
+            motion = "FAILSAFE";
+            led_color = "OFF";
+        } else if (abs(cur_left) < 8 && abs(cur_right) < 8) {
+            motion = "IDLE (0)";
+            led_color = "OFF";
+        } else if (abs_fwd >= abs_turn) {
+            if (fwd_comp > 0) {
+                motion = "FORWARD ";
+                led_color = "GREEN  ";
+            } else {
+                motion = "REVERSE ";
+                led_color = "RED    ";
+            }
+        } else {
+            if (turn_comp > 0) {
+                motion = "RIGHT   ";
+                led_color = "PURPLE ";
+            } else {
+                motion = "LEFT    ";
+                led_color = "YELLOW ";
+            }
+        }
+
+        Serial.printf("[MOTOR] Left: %+4d | Right: %+4d | Motion: %s | LED: %s | RxPkts: %u\n",
+            cur_left, cur_right, motion, led_color, g_rx_packet_count);
     }
 
     // 2 ms loop delay (500 Hz control frequency)
