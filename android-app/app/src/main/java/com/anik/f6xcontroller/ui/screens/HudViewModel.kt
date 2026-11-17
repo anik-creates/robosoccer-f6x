@@ -91,9 +91,21 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     // Java DatagramSocket explicitly bound to the Wi-Fi network (Android kernel bypass guarantee)
     @Volatile
     private var boundDatagramSocket: DatagramSocket? = null
+    @Volatile
+    private var fallbackDatagramSocket: DatagramSocket? = null
     private var javaTxSeq: Short = 0
 
     init {
+        // Fallback unbound socket with broadcast enabled for zero-delay transmission
+        try {
+            fallbackDatagramSocket = DatagramSocket().apply {
+                broadcast = true
+                soTimeout = 10
+            }
+        } catch (e: Exception) {
+            Log.e("HudViewModel", "Failed to create fallback socket: ${e.message}")
+        }
+
         // 1. Initialize native C++ UDP Engine
         NativeUdpBridge.init(connectionSettings.value.ip, connectionSettings.value.port)
         NativeUdpBridge.start()
@@ -211,7 +223,7 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun sendViaJavaSocket(ip: String, port: Int, left: Short, right: Short, aux: Int) {
-        val socket = boundDatagramSocket ?: return
+        val socket = boundDatagramSocket ?: fallbackDatagramSocket ?: return
         try {
             javaTxSeq = (javaTxSeq + 1).toShort()
             val buf = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
@@ -239,6 +251,13 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             val targetAddr = InetAddress.getByName(ip)
             val packet = DatagramPacket(bytes, 12, targetAddr, port)
             socket.send(packet)
+
+            // Also send broadcast to 192.168.4.255 for zero-delay AP discovery
+            try {
+                val bcastAddr = InetAddress.getByName("192.168.4.255")
+                val bcastPacket = DatagramPacket(bytes, 12, bcastAddr, port)
+                socket.send(bcastPacket)
+            } catch (_: Exception) {}
         } catch (e: Exception) {
             // Silently ignore drop; 100 Hz rate recovers on next frame
         }

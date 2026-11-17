@@ -26,6 +26,7 @@
 #include <WiFiUdp.h>
 #include <esp_wifi.h>
 #include <driver/ledc.h>
+#include <soc/gpio_struct.h>
 #include "protocol.h"
 
 // -------------------------------------------------------------------------------------
@@ -79,14 +80,52 @@ WiFiUDP g_udp;
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // -------------------------------------------------------------------------------------
-// NeoPixel Status Visualizer
+// Universal Multi-Pin NeoPixel (WS2812) Status Driver
+// Simultaneously drives GPIO 48, GPIO 38, and GPIO 21 at register level
+// Works on DevKitC-1, YD-ESP32-S3, NodeMCU ESP32-S3, and generic clones.
 // -------------------------------------------------------------------------------------
+void init_status_led() {
+    pinMode(48, OUTPUT);
+    pinMode(38, OUTPUT);
+    pinMode(21, OUTPUT);
+    digitalWrite(48, LOW);
+    digitalWrite(38, LOW);
+    digitalWrite(21, LOW);
+}
+
 void set_status_led(uint8_t r, uint8_t g, uint8_t b) {
-#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-    rgbLedWrite(RGB_BUILTIN, r, g, b);
-#else
-    neopixelWrite(RGB_BUILTIN, r, g, b);
-#endif
+    // Upper pins in GPIO.out1: GPIO 48 (bit 16) and GPIO 38 (bit 6)
+    const uint32_t mask1 = (1UL << (48 - 32)) | (1UL << (38 - 32));
+    // Lower pin in GPIO.out: GPIO 21 (bit 21)
+    const uint32_t mask0 = (1UL << 21);
+
+    // Color order: GRB (24-bit)
+    uint32_t color = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
+
+    portDISABLE_INTERRUPTS();
+
+    for (int i = 23; i >= 0; i--) {
+        uint32_t bit = (color >> i) & 1;
+        // 240 MHz CPU: 1 cycle = 4.167 ns
+        // Bit 1: 800 ns High (~192 cycles), 450 ns Low (~108 cycles)
+        // Bit 0: 350 ns High (~84 cycles), 900 ns Low (~216 cycles)
+        uint32_t t_high = bit ? 192 : 84;
+        uint32_t t_period = 300; // 1.25 us
+
+        uint32_t start = xthal_get_ccount();
+        GPIO.out1_w1ts.val = mask1;
+        GPIO.out_w1ts      = mask0;
+
+        while ((xthal_get_ccount() - start) < t_high) {}
+
+        GPIO.out1_w1tc.val = mask1;
+        GPIO.out_w1tc      = mask0;
+
+        while ((xthal_get_ccount() - start) < t_period) {}
+    }
+
+    portENABLE_INTERRUPTS();
+    delayMicroseconds(80); // Latch
 }
 
 /**
@@ -98,22 +137,28 @@ void update_status_led(uint32_t now, bool is_failsafe, bool client_connected) {
     const uint32_t BLINK_PERIOD_MS   = 5000;
     const uint32_t BLINK_DURATION_MS = 150;
 
+    static bool s_was_in_blink = false;
     bool is_blink_window = (now % BLINK_PERIOD_MS) < BLINK_DURATION_MS;
 
-    if (!is_blink_window) {
-        set_status_led(0, 0, 0); // OFF
-        return;
-    }
-
-    if (!is_failsafe && client_connected) {
-        // Emerald Green: Connected & Active 100 Hz Control
-        set_status_led(0, 255, 30);
-    } else if (!client_connected) {
-        // Sky Blue: AP Ready / Waiting for Phone
-        set_status_led(0, 50, 255);
+    if (is_blink_window) {
+        if (!s_was_in_blink) {
+            s_was_in_blink = true;
+            if (!is_failsafe && client_connected) {
+                // Emerald Green: Connected & Active 100 Hz Control
+                set_status_led(0, 255, 30);
+            } else if (!client_connected) {
+                // Sky Blue: AP Ready / Waiting for Phone (Link Released)
+                set_status_led(0, 50, 255);
+            } else {
+                // Crimson Red: Failsafe Triggered (> 150 ms packet timeout)
+                set_status_led(255, 0, 0);
+            }
+        }
     } else {
-        // Crimson Red: Failsafe Triggered (> 150 ms packet timeout)
-        set_status_led(255, 0, 0);
+        if (s_was_in_blink) {
+            s_was_in_blink = false;
+            set_status_led(0, 0, 0); // Turn completely OFF
+        }
     }
 }
 
@@ -212,12 +257,31 @@ void emergency_brake() {
 }
 
 // -------------------------------------------------------------------------------------
+// Wi-Fi Event Callbacks
+// -------------------------------------------------------------------------------------
+void on_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+        Serial.printf("[Wi-Fi] Phone connected! MAC: %02X:%02X:%02X:%02X:%02X:%02X, AID: %d\n",
+            info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1],
+            info.wifi_ap_staconnected.mac[2], info.wifi_ap_staconnected.mac[3],
+            info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5],
+            info.wifi_ap_staconnected.aid);
+    } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+        Serial.printf("[Wi-Fi] Phone disconnected! MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+            info.wifi_ap_stadisconnected.mac[0], info.wifi_ap_stadisconnected.mac[1],
+            info.wifi_ap_stadisconnected.mac[2], info.wifi_ap_stadisconnected.mac[3],
+            info.wifi_ap_stadisconnected.mac[4], info.wifi_ap_stadisconnected.mac[5]);
+    }
+}
+
+// -------------------------------------------------------------------------------------
 // Fast Non-Blocking UDP Telemetry Receiver
 // -------------------------------------------------------------------------------------
 void process_udp_packets() {
     uint8_t rx_buffer[64];
     AckPacket ack_packet;
     ack_packet.magic = 0x55AA;
+    static bool s_first_packet = true;
 
     // Drain all queued packets up to latest
     while (int packet_size = g_udp.parsePacket()) {
@@ -240,6 +304,12 @@ void process_udp_packets() {
                         g_failsafe_active   = false;
                         g_client_connected  = true;
                         portEXIT_CRITICAL(&g_mux);
+
+                        if (s_first_packet) {
+                            s_first_packet = false;
+                            Serial.printf("[UDP] FIRST VALID PACKET RECEIVED! Magic: 0x%04X, Seq: %u, Left: %d, Right: %d\n",
+                                pkt->magic, pkt->seq, pkt->left_pwm, pkt->right_pwm);
+                        }
 
                         // 3. Heartbeat ACK every 20 packets for phone RTT calculation
                         if ((pkt->seq % 20) == 0) {
@@ -271,6 +341,9 @@ void setup() {
     Serial.println("  Author: Anik Sarker                                  ");
     Serial.println("=======================================================");
 
+    // Initialize Universal Multi-Pin NeoPixel (WS2812)
+    init_status_led();
+
     // Brief Yellow flash during boot (200 ms)
     set_status_led(180, 80, 0);
 
@@ -280,6 +353,7 @@ void setup() {
 
     // 2. Configure Ultra-Low Latency Wi-Fi Access Point
     Serial.println("[SETUP] Configuring Wi-Fi Access Point...");
+    WiFi.onEvent(on_wifi_event);
     WiFi.mode(WIFI_AP);
     IPAddress local_ip(192, 168, 4, 1);
     IPAddress gateway(192, 168, 4, 1);
@@ -362,7 +436,16 @@ void loop() {
     }
 
     // 5. Short Blink in Indicator Color Every 5 Seconds (No Solid Light)
-    update_status_led(now, is_failsafe, g_client_connected);
+    bool has_client = (WiFi.softAPgetStationNum() > 0) || g_client_connected;
+    update_status_led(now, is_failsafe, has_client);
+
+    // 6. Periodic Serial Diagnostics every 5 seconds
+    static uint32_t s_last_stat_time = 0;
+    if (now - s_last_stat_time >= 5000) {
+        s_last_stat_time = now;
+        Serial.printf("[STATS] Stations: %d | RX Pkts: %u | CRC Errs: %u | Failsafe: %d | PWM: L=%d R=%d\n",
+            WiFi.softAPgetStationNum(), g_rx_packet_count, g_crc_error_count, is_failsafe, cur_left, cur_right);
+    }
 
     // 2 ms loop delay (500 Hz control frequency)
     delay(2);
