@@ -9,6 +9,7 @@ object NativeUdpBridge {
     external fun initNative(ip: String, port: Int): Boolean
     external fun startNative(): Boolean
     external fun stopNative()
+    external fun restartNative(): Boolean
     external fun updateControlsNative(leftPwm: Short, rightPwm: Short, auxPacked: Int)
     external fun getTxCountNative(): Long
     external fun getAckCountNative(): Long
@@ -25,6 +26,10 @@ object NativeUdpBridge {
 
     fun stop() {
         stopNative()
+    }
+
+    fun restart(): Boolean {
+        return restartNative()
     }
 
     fun updateControls(leftPwm: Short, rightPwm: Short, auxPacked: Int) {

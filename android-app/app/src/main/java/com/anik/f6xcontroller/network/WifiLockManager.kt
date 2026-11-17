@@ -5,7 +5,6 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
-import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.PowerManager
@@ -44,33 +43,57 @@ class WifiLockManager(private val context: Context) {
     private val _activeNetwork = MutableStateFlow<Network?>(null)
     val activeNetwork: StateFlow<Network?> = _activeNetwork.asStateFlow()
 
+    var onNetworkBound: ((Network) -> Unit)? = null
+
     init {
-        // Automatically start passive background Wi-Fi monitoring and persistent binding
+        // 1. Immediately check if the phone is already connected to the robot Wi-Fi
+        checkExistingWifiConnection()
+
+        // 2. Start persistent background Wi-Fi monitoring (WITHOUT requiring Internet)
         startPersistentWifiMonitoring()
     }
 
     /**
+     * Checks all currently active networks on the device.
+     * If Wi-Fi is already active (even without internet access), binds immediately.
+     */
+    fun checkExistingWifiConnection() {
+        try {
+            for (network in connectivityManager.allNetworks) {
+                val caps = connectivityManager.getNetworkCapabilities(network)
+                if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    Log.i(TAG, "Discovered active Wi-Fi network at startup: $network")
+                    bindAndLock(network)
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking existing Wi-Fi: ${e.message}")
+        }
+    }
+
+    /**
      * Passively monitors active Wi-Fi connections.
-     * When connected to "RoboSoccer_S3" (or any robot AP), automatically binds process
-     * and acquires high-performance low-latency locks without user intervention.
+     * CRITICAL: Must remove NET_CAPABILITY_INTERNET because robot AP has no internet!
      */
     private fun startPersistentWifiMonitoring() {
         try {
             val request = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .build()
 
             defaultNetworkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     super.onAvailable(network)
-                    val caps = connectivityManager.getNetworkCapabilities(network)
-                    if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                        Log.i(TAG, "Wi-Fi Network Detected: $network. Auto-binding process...")
-                        connectivityManager.bindProcessToNetwork(network)
-                        _activeNetwork.value = network
-                        acquireLocks()
-                        _isConnected.value = true
-                        _statusMessage.value = "CONNECTED (AUTO-PERSIST)"
+                    Log.i(TAG, "Wi-Fi Network Available (No Internet required): $network")
+                    bindAndLock(network)
+                }
+
+                override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                    super.onCapabilitiesChanged(network, networkCapabilities)
+                    if (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                        bindAndLock(network)
                     }
                 }
 
@@ -78,11 +101,7 @@ class WifiLockManager(private val context: Context) {
                     super.onLost(network)
                     if (_activeNetwork.value == network) {
                         Log.w(TAG, "Robot Wi-Fi lost: $network")
-                        connectivityManager.bindProcessToNetwork(null)
-                        _activeNetwork.value = null
-                        _isConnected.value = false
-                        _statusMessage.value = "SEARCHING BOT..."
-                        releaseLocks()
+                        unbindAndRelease()
                     }
                 }
             }
@@ -91,13 +110,45 @@ class WifiLockManager(private val context: Context) {
                 connectivityManager.registerNetworkCallback(request, it)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error registering default network callback: ${e.message}")
+            Log.e(TAG, "Error registering network callback: ${e.message}")
+        }
+    }
+
+    private fun bindAndLock(network: Network) {
+        try {
+            if (_activeNetwork.value == network && _isConnected.value) {
+                return // Already bound and locked
+            }
+
+            val bound = connectivityManager.bindProcessToNetwork(network)
+            Log.i(TAG, "Process successfully bound to Wi-Fi network: $bound ($network)")
+            _activeNetwork.value = network
+            _isConnected.value = true
+            _statusMessage.value = "CONNECTED (ROBOT AP)"
+
+            acquireLocks()
+
+            // Trigger socket recreation on the bound network
+            onNetworkBound?.invoke(network)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to bind and lock network: ${e.message}")
+        }
+    }
+
+    private fun unbindAndRelease() {
+        try {
+            connectivityManager.bindProcessToNetwork(null)
+            _activeNetwork.value = null
+            _isConnected.value = false
+            _statusMessage.value = "SEARCHING BOT..."
+            releaseLocks()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error unbinding network: ${e.message}")
         }
     }
 
     /**
-     * Direct request to connect specifically to the Robot SoftAP.
-     * Automatically called on startup if not already connected.
+     * Request connection specifically to the Robot SoftAP if not already connected.
      */
     fun lockToRobotWifi(ssid: String = "RoboSoccer_S3", passphrase: String = "soccer2026") = connectToRobot(ssid, passphrase)
 
@@ -107,7 +158,9 @@ class WifiLockManager(private val context: Context) {
             return
         }
 
-        disconnect()
+        checkExistingWifiConnection()
+        if (_isConnected.value) return
+
         _statusMessage.value = "CONNECTING TO $ssid..."
         Log.i(TAG, "Requesting low-latency persistent connection to SSID: $ssid")
 
@@ -126,31 +179,21 @@ class WifiLockManager(private val context: Context) {
             networkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     super.onAvailable(network)
-                    Log.i(TAG, "Robot Wi-Fi available: $network")
-                    val bound = connectivityManager.bindProcessToNetwork(network)
-                    _activeNetwork.value = network
-                    acquireLocks()
-                    _isConnected.value = true
-                    _statusMessage.value = "CONNECTED ($ssid)"
-                    Log.i(TAG, "Process successfully bound to robot: $bound")
+                    Log.i(TAG, "Robot Wi-Fi available via specifier: $network")
+                    bindAndLock(network)
                 }
 
                 override fun onLost(network: Network) {
                     super.onLost(network)
-                    Log.w(TAG, "Robot Wi-Fi network lost: $network")
-                    connectivityManager.bindProcessToNetwork(null)
-                    _activeNetwork.value = null
-                    _isConnected.value = false
-                    _statusMessage.value = "DISCONNECTED"
-                    releaseLocks()
+                    if (_activeNetwork.value == network) {
+                        unbindAndRelease()
+                    }
                 }
 
                 override fun onUnavailable() {
                     super.onUnavailable()
-                    Log.e(TAG, "Robot Wi-Fi network unavailable")
-                    _isConnected.value = false
-                    _statusMessage.value = "BOT OFFLINE"
-                    releaseLocks()
+                    Log.w(TAG, "Robot Wi-Fi network specifier unavailable; checking default Wi-Fi")
+                    checkExistingWifiConnection()
                 }
             }
 
@@ -210,19 +253,7 @@ class WifiLockManager(private val context: Context) {
     }
 
     fun disconnect() {
-        try {
-            networkCallback?.let {
-                connectivityManager.unregisterNetworkCallback(it)
-                networkCallback = null
-            }
-            connectivityManager.bindProcessToNetwork(null)
-            _activeNetwork.value = null
-            _isConnected.value = false
-            _statusMessage.value = "DISCONNECTED"
-            releaseLocks()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error disconnecting: ${e.message}")
-        }
+        unbindAndRelease()
     }
 
     fun releaseAll() {

@@ -8,15 +8,15 @@
  *  Core Engineering Specs:
  *  - 4WD Tank Motor Configuration (Dual BTS7960 High-Power H-Bridges)
  *  - Onboard NeoPixel RGB LED Status Indicator:
- *      * Yellow/Orange : System Booting & Initializing
- *      * Pulsing Blue  : AP Ready / Waiting for Phone (Link Released)
- *      * Solid Green   : Phone Connected & Healthy 100 Hz UDP Control
- *      * Blinking Red  : Failsafe Triggered (> 150 ms Packet Timeout)
+ *      * Short flash every 5 seconds in the indicator color (No solid blinding light)
+ *      * Emerald Green flash : Phone Connected & Healthy 100 Hz UDP Control
+ *      * Sky Blue flash      : AP Ready / Waiting for Phone (Link Released)
+ *      * Crimson Red flash   : Failsafe Triggered (> 150 ms Packet Timeout)
  *  - Dedicated 802.11n AP (SSID: "RoboSoccer_S3", Pass: "soccer2026", Ch: 6, HT20)
  *  - esp_wifi_set_ps(WIFI_PS_NONE) for 0 ms modem-sleep latency spikes
  *  - 20 kHz Ultrasonic 8-bit Silent PWM (Zero Audible Motor Whine)
  *  - 12-Byte Packed Binary UDP Protocol @ 100 Hz on Port 4210
- *  - 4-Byte 0x55AA Heartbeat ACK every 25 packets for phone RTT tracking
+ *  - 4-Byte 0x55AA Heartbeat ACK every 20 packets for phone RTT tracking
  *  - 150 ms Hardware Failsafe (Automatic 0-PWM brake & driver disable)
  * =====================================================================================
  */
@@ -87,6 +87,34 @@ void set_status_led(uint8_t r, uint8_t g, uint8_t b) {
 #else
     neopixelWrite(RGB_BUILTIN, r, g, b);
 #endif
+}
+
+/**
+ * Status LED Indicator:
+ * Blinks for 150 ms in the current status color every 5 seconds (5000 ms).
+ * Stays completely OFF for the other 4850 ms of the cycle (no blinding solid light).
+ */
+void update_status_led(uint32_t now, bool is_failsafe, bool client_connected) {
+    const uint32_t BLINK_PERIOD_MS   = 5000;
+    const uint32_t BLINK_DURATION_MS = 150;
+
+    bool is_blink_window = (now % BLINK_PERIOD_MS) < BLINK_DURATION_MS;
+
+    if (!is_blink_window) {
+        set_status_led(0, 0, 0); // OFF
+        return;
+    }
+
+    if (!is_failsafe && client_connected) {
+        // Emerald Green: Connected & Active 100 Hz Control
+        set_status_led(0, 255, 30);
+    } else if (!client_connected) {
+        // Sky Blue: AP Ready / Waiting for Phone
+        set_status_led(0, 50, 255);
+    } else {
+        // Crimson Red: Failsafe Triggered (> 150 ms packet timeout)
+        set_status_led(255, 0, 0);
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -191,38 +219,42 @@ void process_udp_packets() {
     AckPacket ack_packet;
     ack_packet.magic = 0x55AA;
 
-    int packet_size = g_udp.parsePacket();
-    if (packet_size >= (int)sizeof(ControlPacket)) {
-        int bytes_read = g_udp.read(rx_buffer, sizeof(ControlPacket));
-        if (bytes_read == sizeof(ControlPacket)) {
-            ControlPacket *pkt = reinterpret_cast<ControlPacket*>(rx_buffer);
+    // Drain all queued packets up to latest
+    while (int packet_size = g_udp.parsePacket()) {
+        if (packet_size >= (int)sizeof(ControlPacket)) {
+            int bytes_read = g_udp.read(rx_buffer, sizeof(ControlPacket));
+            if (bytes_read == sizeof(ControlPacket)) {
+                ControlPacket *pkt = reinterpret_cast<ControlPacket*>(rx_buffer);
 
-            // 1. Verify 0xAA55 Magic Word
-            if (pkt->magic == 0xAA55) {
-                // 2. Compute & Verify CRC-16 over first 10 bytes
-                uint16_t computed_crc = calculate_crc16(rx_buffer, 10);
-                if (computed_crc == pkt->crc16) {
-                    portENTER_CRITICAL(&g_mux);
-                    g_target_left_pwm   = pkt->left_pwm;
-                    g_target_right_pwm  = pkt->right_pwm;
-                    g_target_aux_packed = pkt->aux_packed;
-                    g_last_packet_time  = millis();
-                    g_rx_packet_count++;
-                    g_failsafe_active   = false;
-                    g_client_connected  = true;
-                    portEXIT_CRITICAL(&g_mux);
+                // 1. Verify 0xAA55 Magic Word
+                if (pkt->magic == 0xAA55) {
+                    // 2. Compute & Verify CRC-16 over first 10 bytes
+                    uint16_t computed_crc = calculate_crc16(rx_buffer, 10);
+                    if (computed_crc == pkt->crc16) {
+                        portENTER_CRITICAL(&g_mux);
+                        g_target_left_pwm   = pkt->left_pwm;
+                        g_target_right_pwm  = pkt->right_pwm;
+                        g_target_aux_packed = pkt->aux_packed;
+                        g_last_packet_time  = millis();
+                        g_rx_packet_count++;
+                        g_failsafe_active   = false;
+                        g_client_connected  = true;
+                        portEXIT_CRITICAL(&g_mux);
 
-                    // 3. Heartbeat ACK every 25 packets for phone RTT calculation
-                    if ((pkt->seq % 25) == 0) {
-                        ack_packet.ack_seq = pkt->seq;
-                        g_udp.beginPacket(g_udp.remoteIP(), g_udp.remotePort());
-                        g_udp.write(reinterpret_cast<const uint8_t*>(&ack_packet), sizeof(AckPacket));
-                        g_udp.endPacket();
+                        // 3. Heartbeat ACK every 20 packets for phone RTT calculation
+                        if ((pkt->seq % 20) == 0) {
+                            ack_packet.ack_seq = pkt->seq;
+                            g_udp.beginPacket(g_udp.remoteIP(), g_udp.remotePort());
+                            g_udp.write(reinterpret_cast<const uint8_t*>(&ack_packet), sizeof(AckPacket));
+                            g_udp.endPacket();
+                        }
+                    } else {
+                        g_crc_error_count++;
                     }
-                } else {
-                    g_crc_error_count++;
                 }
             }
+        } else {
+            g_udp.flush();
         }
     }
 }
@@ -239,7 +271,7 @@ void setup() {
     Serial.println("  Author: Anik Sarker                                  ");
     Serial.println("=======================================================");
 
-    // Status: Yellow (Booting)
+    // Brief Yellow flash during boot (200 ms)
     set_status_led(180, 80, 0);
 
     // 1. Initialize BTS7960 Motor Drivers
@@ -278,8 +310,8 @@ void setup() {
     g_last_packet_time = millis();
     Serial.println("[SYSTEM] Robot Ready for High-Speed Telemetry.");
 
-    // Status: Blue Pulse (AP Ready, Waiting for Phone)
-    set_status_led(0, 40, 180);
+    // LED off after boot
+    set_status_led(0, 0, 0);
 }
 
 // -------------------------------------------------------------------------------------
@@ -316,23 +348,9 @@ void loop() {
         }
     }
 
-    // 4. Motor Execution & Visual Status LED
+    // 4. Motor Execution
     if (is_failsafe) {
         emergency_brake();
-
-        // If client never connected yet: Pulse Blue (Waiting for phone)
-        // If client was connected but timed out: Flash Crimson Red
-        if (!g_client_connected) {
-            uint8_t breath = (sin(now / 300.0) + 1.0) * 80;
-            set_status_led(0, 20, breath + 20);
-        } else {
-            // Rapid Red Blink (Link Lost Failsafe)
-            if ((now / 150) % 2 == 0) {
-                set_status_led(220, 0, 0);
-            } else {
-                set_status_led(0, 0, 0);
-            }
-        }
     } else {
         // Healthy Link: Enable BTS7960 Drivers & Drive Motors
         digitalWrite(LEFT_EN_PIN, HIGH);
@@ -341,10 +359,10 @@ void loop() {
         apply_left_motor(cur_left);
         apply_right_motor(cur_right);
         apply_aux_channels(cur_aux);
-
-        // Solid Emerald Green (Active 100 Hz Control)
-        set_status_led(0, 200, 30);
     }
+
+    // 5. Short Blink in Indicator Color Every 5 Seconds (No Solid Light)
+    update_status_led(now, is_failsafe, g_client_connected);
 
     // 2 ms loop delay (500 Hz control frequency)
     delay(2);

@@ -115,7 +115,13 @@ public:
             fcntl(sockfd_, F_SETFL, flags | O_NONBLOCK);
         }
 
-        // 4. Increase socket send/receive buffer sizes
+        // 4. Enable Broadcast & Address Reuse
+        int broadcast = 1;
+        setsockopt(sockfd_, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+        int reuse = 1;
+        setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        // 5. Increase socket send/receive buffer sizes
         int buf_size = 64 * 1024;
         setsockopt(sockfd_, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
         setsockopt(sockfd_, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
@@ -125,7 +131,7 @@ public:
         running_.store(true);
         worker_thread_ = std::thread(&UdpEngine::threadLoop, this);
 
-        // 5. Attempt to elevate thread priority
+        // 6. Attempt to elevate thread priority
         pthread_t native_handle = worker_thread_.native_handle();
         struct sched_param param;
         param.sched_priority = sched_get_priority_max(SCHED_FIFO);
@@ -156,6 +162,11 @@ public:
         }
 
         LOGI("UDP Engine stopped gracefully. Stop packets sent.");
+    }
+
+    bool restart() {
+        stop();
+        return start();
     }
 
     void updateControls(int16_t left, int16_t right, uint16_t aux) {
@@ -316,6 +327,12 @@ JNIEXPORT jboolean JNICALL
 Java_com_anik_f6xcontroller_transport_NativeUdpBridge_startNative(
         JNIEnv * /* env */, jobject /* thiz */) {
     return static_cast<jboolean>(UdpEngine::getInstance().start());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_anik_f6xcontroller_transport_NativeUdpBridge_restartNative(
+        JNIEnv * /* env */, jobject /* thiz */) {
+    return static_cast<jboolean>(UdpEngine::getInstance().restart());
 }
 
 JNIEXPORT void JNICALL

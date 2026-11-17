@@ -2,6 +2,8 @@ package com.anik.f6xcontroller.ui.screens
 
 import android.app.Application
 import android.content.Context
+import android.net.Network
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.anik.f6xcontroller.data.*
@@ -9,6 +11,7 @@ import com.anik.f6xcontroller.dsp.FsI6xMixer
 import com.anik.f6xcontroller.dsp.ProcessedChannels
 import com.anik.f6xcontroller.dsp.StickInputs
 import com.anik.f6xcontroller.network.AppUpdateManager
+import com.anik.f6xcontroller.network.CheckUpdateResult
 import com.anik.f6xcontroller.network.UpdateInfo
 import com.anik.f6xcontroller.network.WifiLockManager
 import com.anik.f6xcontroller.transport.NativeUdpBridge
@@ -17,6 +20,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class HudViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -72,7 +80,7 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     val updateError = MutableStateFlow<String?>(null)
     val updateStatusText = MutableStateFlow<String?>("Tap Check to query latest GitHub release")
 
-    // Telemetry from C++ Engine
+    // Telemetry from UDP Engine
     private val _telemetry = MutableStateFlow(TelemetryStats())
     val telemetry: StateFlow<TelemetryStats> = _telemetry.asStateFlow()
 
@@ -80,22 +88,33 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     private val _processedChannels = MutableStateFlow(ProcessedChannels())
     val processedChannels: StateFlow<ProcessedChannels> = _processedChannels.asStateFlow()
 
+    // Java DatagramSocket explicitly bound to the Wi-Fi network (Android kernel bypass guarantee)
+    @Volatile
+    private var boundDatagramSocket: DatagramSocket? = null
+    private var javaTxSeq: Short = 0
+
     init {
         // 1. Initialize native C++ UDP Engine
         NativeUdpBridge.init(connectionSettings.value.ip, connectionSettings.value.port)
         NativeUdpBridge.start()
 
-        // 2. Automatically bind & lock to robot Wi-Fi AP (no manual step required)
-        viewModelScope.launch {
-            delay(500) // Brief delay for network stack initialization
-            val s = connectionSettings.value
-            wifiLockManager.lockToRobotWifi(s.ssid, s.passphrase)
+        // 2. Wire up Wi-Fi network binding callback: when phone connects to robot AP,
+        // restart native socket and bind Java DatagramSocket to the Wi-Fi network
+        wifiLockManager.onNetworkBound = { network ->
+            Log.i("HudViewModel", "Wi-Fi network bound ($network). Re-binding sockets...")
+            NativeUdpBridge.restart()
+            bindJavaDatagramSocket(network)
         }
 
-        // 3. Check for GitHub updates from aniksarker/robosoccer-f6x on launch
+        // Check if Wi-Fi network is already active at startup
+        wifiLockManager.activeNetwork.value?.let { network ->
+            bindJavaDatagramSocket(network)
+        }
+
+        // 3. Check for GitHub updates from anik-creates/robosoccer-f6x on launch
         checkForUpdates()
 
-        // 4. High-speed 100 Hz DSP & JNI update loop (10 ms)
+        // 4. High-speed 100 Hz DSP & Dual UDP update loop (10 ms)
         viewModelScope.launch(Dispatchers.Default) {
             while (isActive) {
                 val sticks = _rawSticks.value
@@ -103,8 +122,9 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
                 val configs = channelConfigs.value
                 val auxMap = _auxValues.value
                 val tank = tankSettings.value
+                val conn = connectionSettings.value
 
-                // A. Map physical sticks to logical RC channels (CH1..CH4) with 15% snap & deadzone
+                // A. Map physical sticks to logical RC channels (CH1..CH4) with non-restricting snap & deadzone
                 val mapped = FsI6xMixer.mapSticksToChannels(sticks, tank)
 
                 // B. Run each channel through FlySky FS-i6X DSP pipeline
@@ -121,7 +141,6 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
                 _processedChannels.value = ProcessedChannels(ch1Out, ch2Out, ch3Out, ch4Out)
 
                 // C. Motor mixing for 4WD Tank Soccerbot:
-                // Primary: Right Stick Controls: CH2 (Throttle Forward/Reverse) + CH1 (Steering Left/Right)
                 val throttle = ch2Out
                 val steering = ch1Out
 
@@ -137,10 +156,13 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
                 // D. Pack Aux Channels (CH5..CH10)
                 val auxPacked = FsI6xMixer.packAux(auxMap)
 
-                // E. Pass directly to C++ NDK Engine via JNI
+                // E. Path 1: Pass to native C++ NDK Engine via JNI
                 NativeUdpBridge.updateControls(leftPwm, rightPwm, auxPacked)
 
-                // F. Update telemetry state
+                // F. Path 2: Direct Java DatagramSocket transmission (bound to Wi-Fi network)
+                sendViaJavaSocket(conn.ip, conn.port, leftPwm, rightPwm, auxPacked)
+
+                // G. Update telemetry state
                 _telemetry.value = TelemetryStats(
                     txCount = NativeUdpBridge.getTxCount(),
                     ackCount = NativeUdpBridge.getAckCount(),
@@ -155,6 +177,73 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun bindJavaDatagramSocket(network: Network) {
+        try {
+            boundDatagramSocket?.close()
+            val socket = DatagramSocket()
+            network.bindSocket(socket)
+            socket.soTimeout = 10
+            boundDatagramSocket = socket
+            Log.i("HudViewModel", "Java DatagramSocket successfully bound to network: $network")
+
+            // Start background receiver for 4-byte ACKs on bound socket
+            viewModelScope.launch(Dispatchers.IO) {
+                val rxBuf = ByteArray(32)
+                val rxPacket = DatagramPacket(rxBuf, rxBuf.size)
+                while (isActive && boundDatagramSocket == socket && !socket.isClosed) {
+                    try {
+                        socket.receive(rxPacket)
+                        if (rxPacket.length >= 4) {
+                            val magic = (rxBuf[0].toInt() and 0xFF) or ((rxBuf[1].toInt() and 0xFF) shl 8)
+                            if (magic == 0x55AA) {
+                                // ACK received! ESP32-S3 is online and receiving packets!
+                                wifiLockManager.checkExistingWifiConnection()
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // SocketTimeoutException expected on non-blocking receive
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("HudViewModel", "Failed to bind Java DatagramSocket: ${e.message}")
+        }
+    }
+
+    private fun sendViaJavaSocket(ip: String, port: Int, left: Short, right: Short, aux: Int) {
+        val socket = boundDatagramSocket ?: return
+        try {
+            javaTxSeq = (javaTxSeq + 1).toShort()
+            val buf = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
+            buf.putShort(0xAA55.toShort()) // Magic
+            buf.putShort(javaTxSeq)        // Seq
+            buf.putShort(left)             // Left PWM
+            buf.putShort(right)            // Right PWM
+            buf.putShort(aux.toShort())    // Aux packed
+
+            // CRC-16 over first 10 bytes
+            val bytes = buf.array()
+            var crc = 0xFFFF
+            for (i in 0 until 10) {
+                crc = crc xor (bytes[i].toInt() and 0xFF)
+                for (b in 0 until 8) {
+                    crc = if ((crc and 0x0001) != 0) {
+                        (crc ushr 1) xor 0xA001
+                    } else {
+                        crc ushr 1
+                    }
+                }
+            }
+            buf.putShort(crc.toShort())
+
+            val targetAddr = InetAddress.getByName(ip)
+            val packet = DatagramPacket(bytes, 12, targetAddr, port)
+            socket.send(packet)
+        } catch (e: Exception) {
+            // Silently ignore drop; 100 Hz rate recovers on next frame
+        }
+    }
+
     fun checkForUpdates(customRepo: String? = null) {
         val repo = customRepo ?: tankSettings.value.githubRepo
         viewModelScope.launch {
@@ -163,18 +252,18 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
             updateError.value = null
             try {
                 when (val result = AppUpdateManager.checkLatestRelease(repo)) {
-                    is com.anik.f6xcontroller.network.CheckUpdateResult.UpdateAvailable -> {
+                    is CheckUpdateResult.UpdateAvailable -> {
                         updateInfo.value = result.info
-                        updateStatusText.value = "New release available: ${result.info.tagName}!"
+                        updateStatusText.value = "Update Available: ${result.info.tagName}"
                     }
-                    is com.anik.f6xcontroller.network.CheckUpdateResult.UpToDate -> {
+                    is CheckUpdateResult.UpToDate -> {
                         updateInfo.value = null
-                        updateStatusText.value = "App is already up-to-date (v${result.currentVersion})."
+                        updateStatusText.value = "App is up to date (${result.currentVersion})"
                     }
-                    is com.anik.f6xcontroller.network.CheckUpdateResult.Error -> {
+                    is CheckUpdateResult.Error -> {
                         updateInfo.value = null
-                        updateStatusText.value = result.message
                         updateError.value = result.message
+                        updateStatusText.value = "Check failed: ${result.message}"
                     }
                 }
             } catch (e: Exception) {
@@ -189,60 +278,58 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     fun downloadAndInstallUpdate(context: Context) {
         val info = updateInfo.value ?: return
         viewModelScope.launch {
-            updateProgress.value = 0f
-            AppUpdateManager.downloadAndInstallApk(
-                context = context,
-                apkUrl = info.apkDownloadUrl,
-                onProgress = { p -> updateProgress.value = p },
-                onError = { err ->
-                    updateError.value = err
-                    updateProgress.value = null
-                }
-            )
+            updateProgress.value = 0.0f
+            updateStatusText.value = "Downloading ${info.tagName}..."
+            try {
+                AppUpdateManager.downloadAndInstallApk(
+                    context = context,
+                    apkUrl = info.apkDownloadUrl,
+                    onProgress = { progress ->
+                        updateProgress.value = progress
+                        updateStatusText.value = "Downloading: ${(progress * 100).toInt()}%"
+                    },
+                    onError = { err ->
+                        updateError.value = err
+                        updateStatusText.value = "Download failed: $err"
+                    }
+                )
+                updateStatusText.value = "Download complete. Starting installer..."
+            } catch (e: Exception) {
+                updateError.value = e.message
+                updateStatusText.value = "Download failed: ${e.message}"
+            } finally {
+                updateProgress.value = null
+            }
         }
     }
 
+    // Stick touch handling
     fun updateLeftStick(x: Float, y: Float) {
-        _rawSticks.update { it.copy(leftX = x, leftY = y) }
+        _rawSticks.value = _rawSticks.value.copy(leftX = x, leftY = y)
     }
 
     fun updateRightStick(x: Float, y: Float) {
-        _rawSticks.update { it.copy(rightX = x, rightY = y) }
+        _rawSticks.value = _rawSticks.value.copy(rightX = x, rightY = y)
     }
 
+    // Aux control handling
     fun updateAuxChannel(channel: Int, value: Float) {
-        _auxValues.update { current ->
-            current.toMutableMap().apply { put(channel, value.coerceIn(0f, 1f)) }
-        }
+        val current = _auxValues.value.toMutableMap()
+        current[channel] = value
+        _auxValues.value = current
     }
 
+    // Emergency stop / Brake
     fun emergencyStop() {
-        _rawSticks.value = StickInputs(0f, 0f, 0f, 0f)
-        _auxValues.value = mapOf(5 to 0f, 6 to 0f, 7 to 0f, 8 to 0f, 9 to 0f, 10 to 0f)
+        updateRightStick(0f, 0f)
+        updateLeftStick(0f, 0f)
         NativeUdpBridge.updateControls(0, 0, 0)
     }
 
-    fun toggleAutoCenterLeft() {
-        val configs = channelConfigs.value
-        val ch3 = configs[3] ?: return
-        viewModelScope.launch {
-            repository.saveChannelConfig(ch3.copy(autoCenter = !ch3.autoCenter))
-        }
-    }
-
-    fun toggleAutoCenterRight() {
-        val configs = channelConfigs.value
-        val ch2 = configs[2] ?: return
-        viewModelScope.launch {
-            repository.saveChannelConfig(ch2.copy(autoCenter = !ch2.autoCenter))
-        }
-    }
-
-    // Layout editing methods
+    // Edit HUD operations
     fun toggleEditMode() {
-        val next = !isEditMode.value
-        isEditMode.value = next
-        if (!next) {
+        isEditMode.value = !isEditMode.value
+        if (!isEditMode.value) {
             selectedWidgetId.value = null
         }
     }
@@ -256,18 +343,18 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             when (selId) {
                 "STICK_LEFT" -> {
-                    val pos = joystickPositions.value
-                    repository.saveLeftJoystick(pos.leftX, pos.leftY, scale)
+                    val current = joystickPositions.value
+                    repository.saveLeftJoystick(current.leftX, current.leftY, scale)
                 }
                 "STICK_RIGHT" -> {
-                    val pos = joystickPositions.value
-                    repository.saveRightJoystick(pos.rightX, pos.rightY, scale)
+                    val current = joystickPositions.value
+                    repository.saveRightJoystick(current.rightX, current.rightY, scale)
                 }
                 else -> {
-                    val updated = auxWidgets.value.map {
-                        if (it.id == selId) it.copy(scale = scale) else it
+                    val widgets = auxWidgets.value.map { w ->
+                        if (w.id == selId) w.copy(scale = scale) else w
                     }
-                    repository.saveAuxWidgets(updated)
+                    repository.saveAuxWidgets(widgets)
                 }
             }
         }
@@ -277,21 +364,18 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             when (id) {
                 "STICK_LEFT" -> {
-                    val pos = joystickPositions.value
-                    repository.saveLeftJoystick(normX.coerceIn(0.05f, 0.95f), normY.coerceIn(0.15f, 0.95f), pos.leftScale)
+                    val current = joystickPositions.value
+                    repository.saveLeftJoystick(normX, normY, current.leftScale)
                 }
                 "STICK_RIGHT" -> {
-                    val pos = joystickPositions.value
-                    repository.saveRightJoystick(normX.coerceIn(0.05f, 0.95f), normY.coerceIn(0.15f, 0.95f), pos.rightScale)
+                    val current = joystickPositions.value
+                    repository.saveRightJoystick(normX, normY, current.rightScale)
                 }
                 else -> {
-                    val updated = auxWidgets.value.map {
-                        if (it.id == id) it.copy(
-                            normalizedX = normX.coerceIn(0.05f, 0.95f),
-                            normalizedY = normY.coerceIn(0.15f, 0.95f)
-                        ) else it
+                    val widgets = auxWidgets.value.map { w ->
+                        if (w.id == id) w.copy(normalizedX = normX, normalizedY = normY) else w
                     }
-                    repository.saveAuxWidgets(updated)
+                    repository.saveAuxWidgets(widgets)
                 }
             }
         }
@@ -300,7 +384,6 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     fun addAuxWidget(channel: Int, type: WidgetType) {
         val current = auxWidgets.value
         val newId = "AUX_${channel}_${System.currentTimeMillis() % 1000}"
-        // Default position in central region
         val newWidget = WidgetLayout(
             id = newId,
             channel = channel,
@@ -330,7 +413,6 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.saveTankSettings(settings) }
     }
 
-    // Settings adjustments
     fun setStickMode(mode: StickMode) {
         viewModelScope.launch { repository.saveStickMode(mode) }
     }
@@ -364,6 +446,7 @@ class HudViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         NativeUdpBridge.stop()
+        boundDatagramSocket?.close()
         wifiLockManager.disconnect()
     }
 }
